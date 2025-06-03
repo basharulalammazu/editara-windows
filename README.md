@@ -22,7 +22,7 @@ Editara is a modern, user-friendly image format converter for Windows. Easily co
 
 ## Installation
 
-1. Download the latest release from [GitHub Releases](https://github.com/basharulalammazu/imageformatconverter-windows/releases).
+1. Download the latest release from [GitHub Releases](https://github.com/basharulalammazu/editara-windows/releases).
 2. Extract the ZIP file.
 3. Run `main.py` with Python 3.8+ installed.
 
