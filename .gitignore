@@ -1,0 +1,37 @@
+# ...except Python and JSON files
+!*.py
+!*.json
+
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
+*.txt
+
+# Compressed and archive files
+*.rar
+*.zip
+*.z01
+
+# Executables
+*.exe
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# Installer logs and backups
+*.log
+*.bak
+
+# OS-specific
+.DS_Store
+Thumbs.db
