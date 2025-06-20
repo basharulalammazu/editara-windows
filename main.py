@@ -1,15 +1,24 @@
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
-# Image Format Converter Application
+# Eidtara Application (PyQt6 version)
 import os
 import sys
-import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
-from tkinterdnd2 import TkinterDnD, DND_FILES
-from PIL import Image, ImageTk
-import threading
-from tkinter.font import Font
 import json
+import threading
+import platform
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QRadioButton,
+    QFileDialog, QSlider, QProgressBar, QScrollArea, QFrame, QMenu, 
+    QMessageBox, QGroupBox, QSpinBox, QTabWidget, QSplashScreen, QDialog,
+    QGridLayout
+)
+from PyQt6.QtGui import QPixmap, QImage, QIcon, QColor, QPalette, QAction, QPainter, QPen, QBrush
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QPoint, QTimer
+from PIL import Image
+import cv2
+from PIL import Image
+import numpy as np
 import requests
 from packaging import version
 from urllib.parse import urlparse
@@ -23,10 +32,12 @@ try:
 except ImportError:
     MOVIEPY_AVAILABLE = False
 
+
+# List of supported formats
 SUPPORTED_FORMATS = ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp', 'heic']
 SUPPORTED_VIDEO_FORMATS = ['mp4', 'avi', 'mov', 'mkv', 'webm']
 
-# Enhanced Theme Colors with accent colors
+# Theme color schemes
 LIGHT_THEME = {
     "bg": "#f5f5f5",
     "fg": "#333333",
@@ -49,7 +60,6 @@ DARK_THEME = {
     "hover": "#505050"
 }
 
-
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     if hasattr(sys, '_MEIPASS'):
@@ -57,1189 +67,2272 @@ def resource_path(relative_path):
     return os.path.join(os.path.abspath("."), relative_path)
 
 
-class ImageConverterApp:
+# Worker thread for background processing
+class Worker(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(tuple)
+    error = pyqtSignal(str)
+    
+    def __init__(self, function, args):
+        super().__init__()
+        self.function = function
+        self.args = args
+        
+    def run(self):
+        try:
+            result = self.function(*self.args)
+            self.finished.emit((result,))  # Wrap in a tuple!
+        except Exception as e:
+            self.error.emit(str(e))
+
+class UpdateCheckWorker(QThread):
+    finished = pyqtSignal(object, object)  # (result, error)
+
+    def run(self):
+        try:
+            # Check internet connection
+            try:
+                requests.get("https://www.google.com", timeout=5)
+            except requests.RequestException:
+                self.finished.emit(None, "No Internet")
+                return
+
+            # Check GitHub server
+            try:
+                requests.get("https://www.github.com", timeout=5)
+            except requests.RequestException:
+                self.finished.emit(None, "Server Down")
+                return
+
+            repo = "basharulalammazu/editara-windows"
+            api_url = f"https://api.github.com/repos/{repo}/releases"
+            response = requests.get(api_url, timeout=5)
+            if response.status_code == 403 and "rate limit" in response.text.lower():
+                self.finished.emit(None, "Rate Limit Exceeded")
+                return
+
+            if response.status_code != 200:
+                self.finished.emit(None, f"Update Error: {response.status_code}")
+                return
+
+
+            releases = response.json()
+            if not releases:
+                self.finished.emit({"status": "no_update"}, None)
+                return
+
+            latest = sorted(
+                releases,
+                key=lambda r: version.parse(r["tag_name"].lstrip("v")),
+                reverse=True
+            )[0]
+            latest_version = latest["tag_name"].lstrip("v")
+            self.finished.emit({
+                "status": "ok",
+                "latest_version": latest_version,
+                "latest": latest
+            }, None)
+        except Exception as e:
+            self.finished.emit(None, str(e))
+
+
+# Background removal worker
+class RemoveBgWorker(QThread):
+    finished = pyqtSignal(Image.Image)
+    error = pyqtSignal(str)
+    
+    def __init__(self, image):
+        super().__init__()
+        self.image = image
+        
+    def run(self):
+        try:
+            img_no_bg = self.remove_bg_with_opencv(self.image)
+            self.finished.emit(img_no_bg)
+        except Exception as e:
+            self.error.emit(str(e))
+
+# Custom styled button class
+class StyledButton(QPushButton):
+    def __init__(self, text, accent_color="#4CAF50"):
+        super().__init__(text)
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {accent_color};
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {accent_color}DD;
+            }}
+            QPushButton:pressed {{
+                background-color: {accent_color}AA;
+            }}
+        """)
+
+# Custom card/panel frame
+class CardFrame(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShadow(QFrame.Shadow.Raised)
+
+
+
+# Add this class right after the CardFrame class
+class LoadingSpinner(QWidget):
+    def __init__(self, parent=None, size=80, line_width=10, color=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+        self.line_width = line_width
+        self.color = color or QColor(75, 175, 80)  # Default to accent green
+        self.angle = 0
+        self.opacity = 255
+        
+        # Semi-transparent background
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # Animation timer
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.rotate)
+        self.timer.start(40)  # ~25 fps
+        
+        # Label for message underneath spinner
+        self.label = QLabel("Processing...", self)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("background: transparent; color: white; font-weight: bold;")
+        label_size = self.label.sizeHint()
+        self.label.setGeometry(
+            (size - label_size.width()) // 2, 
+            size + 5, 
+            label_size.width(), 
+            label_size.height()
+        )
+    
+    def rotate(self):
+        self.angle = (self.angle + 10) % 360
+        self.update()
+    
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Determine center and radius
+        center = QPoint(self.width() // 2, self.height() // 2)
+        outer_radius = (min(self.width(), self.height()) - self.line_width) // 2
+        
+        # Draw semi-transparent background circle
+        painter.setBrush(QColor(30, 30, 30, 120))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(center, outer_radius + self.line_width, outer_radius + self.line_width)
+        
+        # Draw spinner arcs with gradient opacity
+        pen = QPen()
+        pen.setWidth(self.line_width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        
+        for i in range(8):
+            rotation_angle = self.angle - i * 45
+            opacity = 255 - (i * 32)
+            if opacity < 0:
+                opacity = 0
+                
+            color = QColor(self.color)
+            color.setAlpha(opacity)
+            pen.setColor(color)
+            painter.setPen(pen)
+            
+            painter.save()
+            painter.translate(center)
+            painter.rotate(rotation_angle)
+            painter.drawLine(0, 0, 0, -outer_radius)
+            painter.restore()
+
+# Add this class after the CardFrame class and before Editara:
+
+class ImageCropDialog(QDialog):
+    def __init__(self, image, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Crop Image")
+        self.image = image
+        self.cropped_image = None
+        self.zoom_factor = 1.0  # Track zoom level
+        
+        # Get original image dimensions
+        self.orig_width, self.orig_height = image.size
+        
+        # Convert PIL image to QImage and QPixmap
+        img_array = np.array(image)
+        self.height, self.width = img_array.shape[:2]
+        
+        if image.mode == "RGB":
+            qimg = QImage(img_array.data, self.width, self.height, 
+                        self.width * 3, QImage.Format.Format_RGB888)
+        else:  # RGBA
+            qimg = QImage(img_array.data, self.width, self.height, 
+                        self.width * 4, QImage.Format.Format_RGBA8888)
+        
+        self.pixmap = QPixmap.fromImage(qimg)
+        self.display_pixmap = self.pixmap  # Pixmap that will be displayed (possibly scaled)
+        
+        # Setup UI
+        layout = QVBoxLayout(self)
+        
+        # Add image size information at top
+        size_info = QLabel(f"Original image size: {self.orig_width}x{self.orig_height} pixels")
+        size_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(size_info)
+        
+        # Instructions
+        instruction = QLabel("Select crop area by dragging on the image")
+        instruction.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(instruction)
+        
+        # Add zoom controls
+        zoom_layout = QHBoxLayout()
+        zoom_out_btn = QPushButton("🔍-")
+        zoom_out_btn.clicked.connect(lambda: self.adjust_zoom(0.8))
+        zoom_layout.addWidget(zoom_out_btn)
+        
+        self.zoom_label = QLabel("Zoom: 100%")
+        zoom_layout.addWidget(self.zoom_label)
+        
+        zoom_in_btn = QPushButton("🔍+")
+        zoom_in_btn.clicked.connect(lambda: self.adjust_zoom(1.25))
+        zoom_layout.addWidget(zoom_in_btn)
+        
+        fit_btn = QPushButton("Fit to View")
+        fit_btn.clicked.connect(self.fit_to_view)
+        zoom_layout.addWidget(fit_btn)
+        
+        layout.addLayout(zoom_layout)
+        
+        # Image display area
+        self.image_label = QLabel()
+        self.image_label.setPixmap(self.display_pixmap)
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Make it scrollable if the image is large
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.image_label)
+        self.scroll.setWidgetResizable(True)
+        layout.addWidget(self.scroll)
+        
+        
+        # Crop dimension inputs
+        crop_controls = QHBoxLayout()
+        
+        crop_controls.addWidget(QLabel("X:"))
+        self.x_spin = QSpinBox()
+        self.x_spin.setRange(0, self.width - 10)
+        crop_controls.addWidget(self.x_spin)
+        
+        crop_controls.addWidget(QLabel("Y:"))
+        self.y_spin = QSpinBox()
+        self.y_spin.setRange(0, self.height - 10)
+        crop_controls.addWidget(self.y_spin)
+        
+        crop_controls.addWidget(QLabel("Width:"))
+        self.w_spin = QSpinBox()
+        self.w_spin.setRange(10, self.width)
+        self.w_spin.setValue(self.width)
+        crop_controls.addWidget(self.w_spin)
+        
+        crop_controls.addWidget(QLabel("Height:"))
+        self.h_spin = QSpinBox()
+        self.h_spin.setRange(10, self.height)
+        self.h_spin.setValue(self.height)
+        crop_controls.addWidget(self.h_spin)
+        
+        layout.addLayout(crop_controls)
+        
+        # Connect spin box changes to update rectangle
+        self.x_spin.valueChanged.connect(self.update_crop_rect)
+        self.y_spin.valueChanged.connect(self.update_crop_rect)
+        self.w_spin.valueChanged.connect(self.update_crop_rect)
+        self.h_spin.valueChanged.connect(self.update_crop_rect)
+        
+        # Buttons for actions
+        button_layout = QHBoxLayout()
+        
+        preview_btn = QPushButton("Preview")
+        preview_btn.clicked.connect(self.preview_crop)
+        button_layout.addWidget(preview_btn)
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        crop_btn = QPushButton("Crop")
+        crop_btn.clicked.connect(self.accept)
+        button_layout.addWidget(crop_btn)
+        
+        layout.addLayout(button_layout)
+        
+        # Setup drawing variables
+        self.drawing = False
+        self.start_point = None
+        self.current_rectangle = None
+        
+        # Enable mouse tracking on label
+        self.image_label.setMouseTracking(True)
+        self.image_label.mousePressEvent = self.mouse_press
+        self.image_label.mouseMoveEvent = self.mouse_move
+        self.image_label.mouseReleaseEvent = self.mouse_release
+        
+        # Make dialog larger
+        self.resize(800, 600)
+         
+    def adjust_zoom(self, factor):
+        """Adjust zoom level by the given factor"""
+        self.zoom_factor *= factor
+        self.zoom_factor = max(0.1, min(5.0, self.zoom_factor))  # Limit zoom range
+        self.zoom_label.setText(f"Zoom: {int(self.zoom_factor * 100)}%")
+        self.update_display()
+
+
+    def fit_to_view(self):
+        """Resize image to fit in the viewport"""
+        viewport_size = self.scroll.viewport().size()
+        scale_w = viewport_size.width() / self.pixmap.width()
+        scale_h = viewport_size.height() / self.pixmap.height()
+        self.zoom_factor = min(scale_w, scale_h) * 0.95  # 95% of available space
+        self.zoom_label.setText(f"Zoom: {int(self.zoom_factor * 100)}%")
+        self.update_display()
+
+
+        
+    def update_display(self):
+        """Update displayed image with current zoom"""
+        if hasattr(self, 'modified_pixmap'):
+            # If we've already drawn a crop rectangle, update that version
+            source_pixmap = self.modified_pixmap
+        else:
+            # Otherwise use the original pixmap
+            source_pixmap = self.pixmap
+        
+        # Calculate new size based on zoom
+        new_width = int(self.width * self.zoom_factor)
+        new_height = int(self.height * self.zoom_factor)
+        
+        if new_width > 0 and new_height > 0:
+            self.display_pixmap = source_pixmap.scaled(
+                new_width, new_height, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.image_label.setPixmap(self.display_pixmap)
+            self.image_label.setFixedSize(new_width, new_height)
+
+    
+
+    def mouse_press(self, event):
+        self.drawing = True
+        self.start_point = event.pos()
+        
+        # Adjust for scroll position and image position
+        scroll_area = self.image_label.parent().parent()
+        self.scroll_x = scroll_area.horizontalScrollBar().value()
+        self.scroll_y = scroll_area.verticalScrollBar().value()
+        
+        # Calculate offset if image is centered
+        self.offset_x = max(0, (self.image_label.width() - self.pixmap.width()) // 2)
+        self.offset_y = max(0, (self.image_label.height() - self.pixmap.height()) // 2)
+        
+        x = max(0, min(event.pos().x() - self.offset_x + self.scroll_x, self.width))
+        y = max(0, min(event.pos().y() - self.offset_y + self.scroll_y, self.height))
+        
+        self.x_spin.setValue(x)
+        self.y_spin.setValue(y)
+    
+    def mouse_move(self, event):
+        if not self.drawing:
+            return
+            
+        # Calculate current position with scroll adjustments
+        x = max(0, min(event.pos().x() - self.offset_x + self.scroll_x, self.width))
+        y = max(0, min(event.pos().y() - self.offset_y + self.scroll_y, self.height))
+        
+        # Update width/height spins
+        width = max(1, x - self.x_spin.value())
+        height = max(1, y - self.y_spin.value())
+        
+        self.w_spin.setValue(width)
+        self.h_spin.setValue(height)
+    
+    def mouse_release(self, event):
+        self.drawing = False
+        self.update_crop_rect()
+    
+    def update_crop_rect(self):
+        # Create a copy of the original image to draw on
+        if hasattr(self, 'modified_pixmap'):
+            del self.modified_pixmap
+        self.modified_pixmap = self.pixmap.copy()
+        
+        # Draw rectangle on the image
+        painter = QPainter(self.modified_pixmap)
+        painter.setPen(QPen(QColor(255, 0, 0), 2))
+        painter.drawRect(
+            self.x_spin.value(), 
+            self.y_spin.value(),
+            self.w_spin.value(),
+            self.h_spin.value()
+        )
+        painter.end()
+        
+        # Update displayed image
+        self.image_label.setPixmap(self.modified_pixmap)
+    
+    def preview_crop(self):
+        # Show a preview of the cropped image
+        x = self.x_spin.value()
+        y = self.y_spin.value()
+        width = self.w_spin.value()
+        height = self.h_spin.value()
+        
+        # Ensure valid crop area
+        if width <= 0 or height <= 0:
+            return
+            
+        # Crop the PIL Image
+        cropped = self.image.crop((x, y, x + width, y + height))
+        
+        # Convert to QImage/QPixmap for display
+        img_array = np.array(cropped)
+        if cropped.mode == "RGB":
+            qimg = QImage(img_array.data, width, height, width * 3, QImage.Format.Format_RGB888)
+        else:  # RGBA
+            qimg = QImage(img_array.data, width, height, width * 4, QImage.Format.Format_RGBA8888)
+            
+        preview_pixmap = QPixmap.fromImage(qimg)
+        
+        # Show preview dialog
+        preview = QDialog(self)
+        preview.setWindowTitle("Crop Preview")
+        preview_layout = QVBoxLayout(preview)
+        
+        preview_label = QLabel()
+        preview_label.setPixmap(preview_pixmap)
+        preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_layout.addWidget(preview_label)
+        
+        close_btn = QPushButton("Close Preview")
+        close_btn.clicked.connect(preview.close)
+        preview_layout.addWidget(close_btn)
+        
+        preview.exec()
+    
+    def get_cropped_image(self):
+        # Return the cropped PIL Image
+        x = self.x_spin.value()
+        y = self.y_spin.value()
+        width = self.w_spin.value()
+        height = self.h_spin.value()
+        
+        # Ensure valid crop area
+        if width <= 0 or height <= 0:
+            return None
+            
+        # Crop the PIL Image
+        return self.image.crop((x, y, x + width, y + height))
+    
+
+
+
+# Main application window
+class Editara(QMainWindow):
     @staticmethod
     def save_theme(theme_name):
-        with open("app.json", "w") as f:
+        with open("theme.json", "w") as f:
             json.dump({"theme": theme_name}, f)
     
     @staticmethod
     def load_theme():
         try:
-            with open("app.json", "r") as f:
+            with open("theme.json", "r") as f:
                 data = json.load(f)
                 return data.get("theme", "dark")
         except Exception:
             return "dark"
         
-    def __init__(self, root):
-        self.root = root
-        self.root.resizable(False, False)  # Disable maximize option
-        self.root.title("Image Format Converter")
-
-
-        # Add menu bar for settings, privacy, docs, policy, help, about
-        self.menu_bar = tk.Menu(self.root)
-        self.settings_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.settings_menu.add_command(label="Privacy", command=self.show_privacy)
-        self.settings_menu.add_command(label="Documentation", command=self.show_documentation)
-        self.settings_menu.add_command(label="Policy", command=self.show_policy)
-        self.settings_menu.add_separator()
-        self.settings_menu.add_command(label="Help", command=self.show_help)
-        self.settings_menu.add_command(label="About", command=self.show_about)
-        self.menu_bar.add_cascade(label="Settings", menu=self.settings_menu)
-        self.root.config(menu=self.menu_bar)
-
-        # Load theme
-        theme_name = ImageConverterApp.load_theme()
-        self.theme = DARK_THEME if theme_name == "dark" else LIGHT_THEME
-
-        # Add favicon (icon)
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Eidtara")
+        self.setMinimumSize(700, 00)
+        
+        # Remove maximize button but keep minimize and close buttons
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowCloseButtonHint |
+            Qt.WindowType.WindowMinimizeButtonHint
+        )
+        
+        # Load app icon
         try:
-            icon_path = resource_path("appicon.ico")
-            self.root.iconbitmap(icon_path)            
-            if not os.path.exists(icon_path):
-                raise FileNotFoundError(f"Icon file not found: {icon_path}")
-            self.root.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Could not set window icon: {e}")
-
-        # Load theme
-        theme_name = ImageConverterApp.load_theme()
-        self.theme = DARK_THEME if theme_name == "dark" else LIGHT_THEME
-
-
-        self.folder_var = tk.StringVar()
-        self.format_var = tk.StringVar(value="webp")
-        self.quality_var = tk.IntVar(value=90)
-        self.is_converting = False
+            app_icon = QIcon(resource_path("appicon.ico"))
+            self.setWindowIcon(app_icon)
+        except:
+            pass
+        
+        # Variables for conversion
+        self.selected_files = []
+        self.file_types = []  # image or video
         self.file_count = 0
-        self.file_types = []  # Store the type of files (image or video) uploaded
+        self.is_converting = False
+        self.output_folder = ""
+        self.mode = "Image"  # Image or Video
+        
+        # Variables for image edit
+        self.edit_image = None
+        self.edit_image_path = None
+        
+        # Load theme
+        theme_name = self.load_theme()
+        self.theme = DARK_THEME if theme_name == "dark" else LIGHT_THEME
+        
+        # Create menu bar
+        self.setup_menu()
+        
+        # Create main UI
+        self.create_ui()
+        
+        # Apply theme
+        self.apply_theme()
+    
 
-        # For mode selection
-        self.mode_var = tk.StringVar(value="Image")
+    def show_info(self, title, message):
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+        msg.exec()
 
-        # For resizing
-        self.resize_var = tk.BooleanVar(value=False)
-        self.resize_mode_var = tk.StringVar(value="both")
-        self.width_var = tk.StringVar()
-        self.height_var = tk.StringVar()
+    def show_warning(self, title, message):
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        msg.setIconPixmap(self.get_accent_icon("warning").pixmap(48, 48))
+        msg.exec()
 
-        # Create custom fonts
-        self.heading_font = Font(family="Segoe UI", size=12, weight="bold")
-        self.normal_font = Font(family="Segoe UI", size=10)
-        self.small_font = Font(family="Segoe UI", size=9)
+    def show_error(self, title, message):
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+        msg.exec()
 
-        # Initialize the main window
-        self.root.update_idletasks()
-        window_width = self.root.winfo_width()
-        window_height = self.root.winfo_height()
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = (screen_width - window_width - 300) // 2
-        y = (screen_height - window_height - 250) // 2
-        self.root.geometry(f"+{x}+{y}")
+    def get_accent_icon(self, icon_type="info"):
+        # Create a pixmap with your accent color
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        brush = QBrush(QColor(self.theme["accent"]))
+        painter.setBrush(brush)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(8, 8, 48, 48)
+        painter.setPen(QColor("white"))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(32)
+        painter.setFont(font)
+        if icon_type == "info":
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "i")
+        elif icon_type == "question":
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "?")
+        elif icon_type == "warning":
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "!")
+        elif icon_type == "error":
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "×")
+        painter.end()
+        return QIcon(pixmap)
 
-        self.setup_ui()
+     # Add these methods here
+    def show_loading(self, message="Processing..."):
+        # Create a semi-transparent overlay for the entire app
+        self.overlay = QWidget(self)
+        self.overlay.setGeometry(self.rect())
+        self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 150);")
+        
+        # Create and position the spinner
+        self.spinner = LoadingSpinner(self.overlay, color=QColor(self.theme["accent"]))
+        self.spinner.label.setText(message)
+        
+        # Center the spinner in the overlay
+        spinner_x = (self.overlay.width() - self.spinner.width()) // 2
+        spinner_y = (self.overlay.height() - self.spinner.height()) // 2
+        self.spinner.move(spinner_x, spinner_y)
+        
+        # Show the overlay with spinner
+        self.overlay.show()
+        self.overlay.raise_()
+
+    def hide_loading(self):
+        if hasattr(self, 'overlay') and self.overlay is not None:
+            self.overlay.hide()
+            self.overlay.deleteLater
+   
+        
+    def setup_menu(self):
+        menubar = self.menuBar()
+        
+        # Settings menu
+        settings_menu = menubar.addMenu("Settings")
+        
+        privacy_action = QAction("Privacy", self)
+        privacy_action.triggered.connect(self.show_privacy)
+        settings_menu.addAction(privacy_action)
+        
+        docs_action = QAction("Documentation", self)
+        docs_action.triggered.connect(self.show_documentation)
+        settings_menu.addAction(docs_action)
+        
+        policy_action = QAction("Policy", self)
+        policy_action.triggered.connect(self.show_policy)
+        settings_menu.addAction(policy_action)
+        
+         # --- Add Update action here ---
+        update_action = QAction("Check for Update", self)
+        update_action.triggered.connect(self.check_for_update)
+        settings_menu.addAction(update_action)
+
+        settings_menu.addSeparator()
+        
+        help_action = QAction("Help", self)
+        help_action.triggered.connect(self.show_help)
+        settings_menu.addAction(help_action)
+        
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        settings_menu.addAction(about_action)
+        
+        # Tools menu
+        tools_menu = menubar.addMenu("Tools")
+        
+        converter_action = QAction("Converter", self)
+        converter_action.triggered.connect(self.show_converter)
+        tools_menu.addAction(converter_action)
+        
+        image_edit_action = QAction("Image Edit", self)
+        image_edit_action.triggered.connect(self.show_image_edit)
+        tools_menu.addAction(image_edit_action)
+        
+        # Theme menu
+        theme_menu = menubar.addMenu("Theme")
+        
+        toggle_theme_action = QAction("Toggle Theme", self)
+        toggle_theme_action.triggered.connect(self.toggle_theme)
+        theme_menu.addAction(toggle_theme_action)
+    
+    def create_ui(self):
+        # Central widget and main layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        self.main_layout = QVBoxLayout(central_widget)
+        self.main_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Tab widget to switch between Converter and Image Edit
+        self.tab_widget = QTabWidget()
+        
+        # Create converter tab
+        self.converter_tab = QWidget()
+        self.converter_layout = QVBoxLayout(self.converter_tab)
+        self.setup_converter_ui()
+        self.tab_widget.addTab(self.converter_tab, "Converter")
+        
+        # Create image edit tab
+        self.image_edit_tab = QWidget()
+        self.image_edit_layout = QVBoxLayout(self.image_edit_tab)
+        self.setup_image_edit_ui()
+        self.tab_widget.addTab(self.image_edit_tab, "Image Edit")
+        
+        # Connect tab change signal
+        self.tab_widget.currentChanged.connect(self.on_tab_changed)
+        
+        self.main_layout.addWidget(self.tab_widget)
+        
+        # Status bar at the bottom
+        self.statusBar().showMessage("Ready")
+
+    def setup_converter_ui(self):
+        # Header
+        header_layout = QHBoxLayout()
+        self.header_label = QLabel("Eidtara")
+        self.header_label.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {self.theme['fg']};"
+        )
+        header_layout.addWidget(self.header_label)
+        header_layout.addStretch()
+                
+        # Theme toggle button in the header
+        self.theme_button = QPushButton("🌙" if self.theme == DARK_THEME else "☀️")
+        self.theme_button.clicked.connect(self.toggle_theme)
+        self.theme_button.setFixedWidth(40)
+        header_layout.addWidget(self.theme_button)
+        
+        self.converter_layout.addLayout(header_layout)
+        
+        # Source files card
+        source_card = CardFrame()
+        source_layout = QVBoxLayout(source_card)
+        
+        self.source_header = QLabel("Source Files")
+        self.source_header.setStyleSheet(
+            f"font-weight: bold; color: {self.theme['fg']};"
+        )
+        source_layout.addWidget(self.source_header)
+        
+        # File path input and browse button
+        file_layout = QHBoxLayout()
+        self.file_path_input = QLineEdit()
+        self.file_path_input.setPlaceholderText("Drag and drop files here or click Browse")
+        self.file_path_input.setAcceptDrops(True)
+        self.file_path_input.dragEnterEvent = self.dragEnterEvent
+        self.file_path_input.dropEvent = self.dropEvent
+        file_layout.addWidget(self.file_path_input)
+        
+        browse_button = StyledButton("Browse")
+        browse_button.clicked.connect(self.browse_files)
+        file_layout.addWidget(browse_button)
+        
+        preview_button = StyledButton("Preview")
+        preview_button.clicked.connect(self.preview_files)
+        file_layout.addWidget(preview_button)
+        
+        source_layout.addLayout(file_layout)
+        
+        # Drop hint and file count label
+        self.drop_label = QLabel("✨ Drag and drop a folder or image/video files here")
+        source_layout.addWidget(self.drop_label)
+        
+        self.files_label = QLabel("No files selected")
+        source_layout.addWidget(self.files_label)
+        
+        self.converter_layout.addWidget(source_card)
+        
+        # Settings card
+        settings_card = CardFrame()
+        settings_layout = QVBoxLayout(settings_card)
+        
+        # Mode switch buttons
+        mode_layout = QHBoxLayout()
+        self.file_type_label = QLabel("Select your file type:")
+        self.file_type_label.setStyleSheet(f"font-weight: bold; color: {self.theme['fg']};")
+        mode_layout.addWidget(self.file_type_label)
+        mode_layout.addStretch(1)
+
+        self.image_button = QPushButton("Image")
+        self.image_button.setCheckable(True)
+        self.image_button.setChecked(True)
+        self.image_button.clicked.connect(lambda: self.set_mode("Image"))
+
+        self.video_button = QPushButton("Video")
+        self.video_button.setCheckable(True)
+        self.video_button.clicked.connect(lambda: self.set_mode("Video"))
+
+        mode_layout.addWidget(self.image_button)
+        mode_layout.addWidget(self.video_button)
+
+        settings_layout.addLayout(mode_layout)
+
+
+        # Settings header
+        settings_header = QLabel("Conversion Settings")
+        settings_header.setStyleSheet("font-weight: bold;")
+        settings_layout.addWidget(settings_header)
+        
+        # Format selection
+        format_layout = QHBoxLayout()
+        format_label = QLabel("Output Format:")
+        format_label.setFixedWidth(120)
+        format_layout.addWidget(format_label)
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(SUPPORTED_FORMATS)
+        self.format_combo.setCurrentText("webp")
+        format_layout.addWidget(self.format_combo)
+        format_layout.addStretch()
+        
+        settings_layout.addLayout(format_layout)
+        
+        # Quality slider (for images)
+        self.quality_container = QWidget()  # Create a container widget
+        self.quality_layout = QHBoxLayout(self.quality_container)
+
+        quality_label = QLabel("Image Quality:")
+        quality_label.setFixedWidth(120)
+        self.quality_layout.addWidget(quality_label)
+
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setMinimum(10)
+        self.quality_slider.setMaximum(100)
+        self.quality_slider.setValue(90)
+        self.quality_layout.addWidget(self.quality_slider)
+
+        self.quality_value = QLabel("90%")
+        self.quality_layout.addWidget(self.quality_value)
+
+        # Connect quality slider change
+        self.quality_slider.valueChanged.connect(self.update_quality_label)
+
+        settings_layout.addWidget(self.quality_container)  # Add the container to the layout
+        
+        # Resize options
+        resize_group = QGroupBox("Resize")
+        resize_group.setCheckable(True)
+        resize_group.setChecked(False)
+        resize_layout = QVBoxLayout(resize_group)
+        
+        # Resize mode
+        self.resize_width_radio = QRadioButton("Specify Width")
+        self.resize_height_radio = QRadioButton("Specify Height")
+        self.resize_both_radio = QRadioButton("Specify Both")
+        self.resize_both_radio.setChecked(True)
+        
+        resize_layout.addWidget(self.resize_width_radio)
+        resize_layout.addWidget(self.resize_height_radio)
+        resize_layout.addWidget(self.resize_both_radio)
+        
+        # Dimensions
+        dim_layout = QHBoxLayout()
+        dim_layout.addWidget(QLabel("Width:"))
+        self.width_input = QSpinBox()
+        self.width_input.setRange(1, 10000)
+        self.width_input.setValue(800)
+        dim_layout.addWidget(self.width_input)
+        
+        dim_layout.addWidget(QLabel("Height:"))
+        self.height_input = QSpinBox()
+        self.height_input.setRange(1, 10000)
+        self.height_input.setValue(600)
+        dim_layout.addWidget(self.height_input)
+        
+        resize_layout.addLayout(dim_layout)
+        settings_layout.addWidget(resize_group)
+        self.resize_group = resize_group  # Store for later access
+        
+        # Video time crop (initially hidden)
+        self.time_crop_group = QGroupBox("Video Time Range")
+        time_layout = QHBoxLayout(self.time_crop_group)
+        
+        time_layout.addWidget(QLabel("Start Time (s):"))
+        self.start_time = QSpinBox()
+        self.start_time.setRange(0, 999999)
+        time_layout.addWidget(self.start_time)
+        
+        time_layout.addWidget(QLabel("End Time (s):"))
+        self.end_time = QSpinBox()
+        self.end_time.setRange(0, 999999)
+        self.end_time.setSpecialValueText("End")
+        time_layout.addWidget(self.end_time)
+        
+        settings_layout.addWidget(self.time_crop_group)
+        self.time_crop_group.setVisible(False)
+        
+        self.converter_layout.addWidget(settings_card)
+        
+        # Progress and convert button
+        action_layout = QVBoxLayout()
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        action_layout.addWidget(self.progress_bar)
+        
+        self.convert_button = StyledButton("🚀 Convert", self.theme["accent"])
+        self.convert_button.clicked.connect(self.start_conversion)
+        self.convert_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.theme["accent"]};
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {self.theme["accent_hover"]};
+            }}
+        """)
+        action_layout.addWidget(self.convert_button)
+        
+        self.converter_layout.addLayout(action_layout)
+        self.converter_layout.addStretch()
+    
+    def setup_image_edit_ui(self):
+        # Image edit tools
+        self.tools_label = QLabel("Image Edit Tools")
+        self.tools_label.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {self.theme['fg']};"
+        )
+        self.image_edit_layout.addWidget(self.tools_label)
+        
+        # Buttons for edit tools
+        buttons_layout = QHBoxLayout()
+        
+        upload_btn = StyledButton("Upload Image", self.theme["accent"])
+        upload_btn.clicked.connect(self.upload_edit_image)
+        buttons_layout.addWidget(upload_btn)
+        
+        passport_btn = StyledButton("Passport Size", self.theme["accent"])
+        passport_btn.clicked.connect(self.passport_size_image)
+        buttons_layout.addWidget(passport_btn)
+        
+        # Background removal button
+        bg_btn = StyledButton("Remove Background", self.theme["accent"])
+        bg_btn.clicked.connect(self.remove_background)
+        buttons_layout.addWidget(bg_btn)
+        
+        crop_btn = StyledButton("Crop Image", self.theme["accent"])
+        crop_btn.clicked.connect(self.crop_image)
+        buttons_layout.addWidget(crop_btn)
+
+        # Quality improvement button
+        quality_btn = StyledButton("Improve Quality", self.theme["accent"])
+        quality_btn.clicked.connect(self.improve_quality)
+        buttons_layout.addWidget(quality_btn)
+        
+        self.image_edit_layout.addLayout(buttons_layout)
+
+
+        # Image preview area
+        self.edit_image_label = QLabel("No image uploaded")
+        self.edit_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.edit_image_label.setMinimumHeight(300)
+        self.edit_image_label.setStyleSheet(f"background-color: {self.theme['card_bg']}; border-radius: 8px;")
+        
+        self.image_edit_layout.addWidget(self.edit_image_label)
+        self.image_edit_layout.addStretch(1)
+
+    
+    def on_tab_changed(self, index):
+        if index == 0:  # Converter tab
+            self.statusBar().showMessage("Converter mode active")
+        else:  # Image Edit tab
+            self.statusBar().showMessage("Image Edit mode active")
+
+
+    def check_for_update(self):
+        self.show_loading("Checking for updates...")  # Show spinner
+
+        self.update_worker = UpdateCheckWorker()
+        self.update_worker.finished.connect(self.handle_update_result)
+        self.update_worker.start()
+
+    def handle_update_result(self, result, error):
+        self.hide_loading()
+        if error:
+            if error == "No Internet":
+                msg = QMessageBox(self)
+                msg.setWindowTitle("No Internet")
+                msg.setText("Please check your internet connection and try again.")
+                msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+                msg.exec()
+            elif error == "Server Down":
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Server Down")
+                msg.setText("Oops! It looks like the update server is currently down.\nPlease try again later.")
+                msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+                msg.exec()
+            elif error == "Update Error":
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Update Error")
+                msg.setText("Could not connect to the update server.")
+                msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+                msg.exec()
+            elif error == "Rate Limit Exceeded":
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Rate Limit Exceeded")
+                msg.setText("GitHub update server rate limit has been reached.\nTry again in a few minutes or use a GitHub token.")
+                msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+                msg.exec()
+            else:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Update Error")
+                msg.setText(f"An error occurred while checking for updates:\n{error}")
+                msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+                msg.exec()
+            return
+
+        if result["status"] == "no_update":
+            msg = QMessageBox(self)
+            msg.setWindowTitle("No Update")
+            msg.setText("No releases found.")
+            msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+            msg.exec()
+            return
+
+        latest_version = result["latest_version"]
+        latest = result["latest"]
+        if version.parse(latest_version) > version.parse(__version__):
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Update Available")
+            msg.setText("A newer version is available...")
+            msg.setIconPixmap(self.get_accent_icon("question").pixmap(48, 48))
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            reply = msg.exec()
+
+            if reply == QMessageBox.StandardButton.Yes:
+                exe_asset = next(
+                    (asset for asset in latest["assets"] if asset["name"].endswith(".exe")),
+                    None
+                )
+                if not exe_asset:
+                    msg = QMessageBox(self)
+                    msg.setWindowTitle("Download Error")
+                    msg.setText("No .exe file found in the latest release.")
+                    msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+                    msg.exec()
+                    return
+
+                download_url = exe_asset["browser_download_url"]
+                filename = os.path.basename(urlparse(download_url).path)
+                save_path = os.path.join(os.path.expanduser("~"), "Downloads", filename)
+
+                # Download in a thread to keep spinner visible
+                self.show_loading("Downloading update...")
+                thread = QThread()
+                def download():
+                    try:
+                        with requests.get(download_url, stream=True) as r:
+                            r.raise_for_status()
+                            with open(save_path, 'wb') as f:
+                                for chunk in r.iter_content(chunk_size=8192):
+                                    f.write(chunk)
+                        QTimer.singleShot(0, lambda: (
+                            self.hide_loading(),
+                            QMessageBox(self).setWindowTitle("Download Complete"),
+                            QMessageBox(self).setText(f"The latest version has been downloaded to:\n{save_path}\n\nPlease run it to complete the update."),
+                            QMessageBox(self).setIconPixmap(self.get_accent_icon("info").pixmap(48, 48)),
+                            QMessageBox(self).exec(),
+                            os.startfile(save_path)
+                        ))
+                    except Exception as e:
+                        # ...for download failed...
+                        QTimer.singleShot(0, lambda: (
+                            self.hide_loading(),
+                            QMessageBox(self).setWindowTitle("Download Failed"),
+                            QMessageBox(self).setText(f"Failed to download update:\n{e}"),
+                            QMessageBox(self).setIconPixmap(self.get_accent_icon("error").pixmap(48, 48)),
+                            QMessageBox(self).exec()
+                        ))
+                thread.run = download
+                thread.start()
+        else:
+            # ...for up to date...
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Up To Date")
+            msg.setText(f"You are using the latest version ({__version__}).")
+            msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+            msg.exec()
+  
+    def show_converter(self):
+        self.tab_widget.setCurrentIndex(0)
+    
+    def show_image_edit(self):
+        self.tab_widget.setCurrentIndex(1)
+
+    def upload_edit_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Image",
+            "",
+            "Image files (*.jpg *.jpeg *.png *.bmp *.tiff *.webp *.heic);;All files (*.*)"
+        )
+        if file_path:
+            try:
+                self.edit_image_path = file_path
+                self.edit_image = Image.open(file_path)
+                
+                # Create preview
+                img = self.edit_image.copy()
+                img.thumbnail((300, 300))
+                qimage = self.pil_to_qimage(img)
+                pixmap = QPixmap.fromImage(qimage)
+                
+                self.edit_image_label.setPixmap(pixmap)
+                self.statusBar().showMessage(f"Loaded image: {os.path.basename(file_path)}")
+            except Exception as e:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Error")
+                msg.setText(f"Failed to load image:\n{str(e)}")
+                msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+                msg.exec()
+        else:
+            self.edit_image_path = None
+            self.edit_image = None
+            self.edit_image_label.setText("No image uploaded")
+            self.edit_image_label.setPixmap(QPixmap())
+
+    def passport_size_image(self):
+        if not self.edit_image:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText("Please upload an image first.")
+            msg.setIconPixmap(self.get_accent_icon("warning").pixmap(48, 48))
+            msg.exec()
+            return
+        
+        # Show loading spinner
+        self.show_loading("Creating Passport Photo...")
+    
+        # Resize to passport size (413x531 pixels, 300 DPI)
+        try:
+            passport_img = self.edit_image.copy()
+            passport_img = passport_img.resize((413, 531), Image.LANCZOS)
+            
+            self.hide_loading()  # Hide spinner after processing
+            # Save dialog
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Passport Size Image",
+                os.path.join(self.get_downloads_folder(), "passport_size_image.jpg"),
+                "JPEG (*.jpg);;PNG (*.png);;All files (*.*)"
+            )
+            
+            # ...after saving...
+            if file_path:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Success")
+                msg.setText(f"Passport size image saved:\n{file_path}")
+                msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+                msg.exec()
+
+        except Exception as e:
+            self.hide_loading()
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText(f"Failed to create passport image:\n{str(e)}")
+            msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+            msg.exec()
+
+
+
+    def remove_background(self):
+        if not self.edit_image:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText("Please upload an image first.")
+            msg.setIconPixmap(self.get_accent_icon("warning").pixmap(48, 48))
+            msg.exec()
+            return
+        
+        try:
+            # Show loading spinner
+            self.show_loading("Removing Background...")
+            self.statusBar().showMessage("Removing background, please wait...")
+
+            # Run background removal in a worker thread
+            self.bg_worker = Worker(self.remove_bg_with_opencv, (self.edit_image,))
+            self.bg_worker.finished.connect(self.bg_removal_done)
+            self.bg_worker.error.connect(self.bg_removal_error)
+            self.bg_worker.start()
+
+        # ...on error...
+        except Exception as e:
+            self.hide_loading()
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText(f"Failed to remove background:\n{str(e)}")
+            msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+            msg.exec()
+
+    def remove_bg_with_opencv(self, image):
+        import cv2
+        import numpy as np
+        from PIL import Image
+
+        # Convert PIL to OpenCV image
+        img = np.array(image)
+
+        if len(img.shape) == 2:  # Grayscale fallback
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        has_alpha = img.shape[2] == 4 if len(img.shape) == 3 else False
+
+        # Convert to proper format for OpenCV
+        if has_alpha:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        else:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        # Prepare mask and models for GrabCut
+        mask = np.zeros(img_rgb.shape[:2], np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+
+        height, width = img_rgb.shape[:2]
+        rect_margin = min(width, height) // 6
+        rect = (rect_margin, rect_margin, width - 2*rect_margin, height - 2*rect_margin)
+
+        # Run GrabCut
+        cv2.grabCut(img_rgb, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+
+        # Mask: 1 (fg) and 3 (probable fg) are foreground
+        mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype("uint8")
+
+        # Apply the mask
+        result = img.copy()
+        if has_alpha:
+            result[:, :, 3] = mask2 * 255
+        else:
+            result_rgba = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2RGBA)
+            result_rgba[:, :, 3] = mask2 * 255
+            result = result_rgba
+
+        return Image.fromarray(result)
+
+
+
+    def bg_removal_done(self, result_tuple):
+        self.hide_loading()  # Hide spinner after processing
+        
+        # Unpack the image from the tuple
+        img_no_bg = result_tuple[0]
+        
+        # Continue with existing code
+        display_img = img_no_bg.copy()
+        display_img.thumbnail((300, 300))
+        qimage = self.pil_to_qimage(display_img)
+        pixmap = QPixmap.fromImage(qimage)
+        
+        self.edit_image_label.setPixmap(pixmap)
+        self.statusBar().showMessage("Background removed successfully")
+        
+        # Ask to save
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Background-Removed Image",
+            "",
+            "PNG (*.png);;All files (*.*)"
+        )
+        
+        if file_path:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Success")
+            msg.setText(f"Background-removed image saved:\n{file_path}")
+            msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+            msg.exec()
+
+
+    def bg_removal_error(self, error):
+        self.hide_loading()  # Hide spinner on error
+        self.statusBar().showMessage("Error removing background")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Error")
+        msg.setText(f"Failed to remove background:\n{error}")
+        msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+        msg.exec()
+
+    
+    def crop_image(self):
+        if not self.edit_image:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText("Please upload an image first.")
+            msg.setIconPixmap(self.get_accent_icon("warning").pixmap(48, 48))
+            msg.exec()
+            return
+        
+        try:
+            # Create and show the crop dialog
+            crop_dialog = ImageCropDialog(self.edit_image, self)
+            result = crop_dialog.exec()
+            
+            # If user clicked Crop (accept), process the cropped image
+            if result == QDialog.DialogCode.Accepted:
+                cropped_img = crop_dialog.get_cropped_image()
+                if cropped_img:
+                    # Update display
+                    preview = cropped_img.copy()
+                    preview.thumbnail((300, 300))
+                    qimage = self.pil_to_qimage(preview)
+                    pixmap = QPixmap.fromImage(qimage)
+                    self.edit_image_label.setPixmap(pixmap)
+                    
+                    # Update stored image
+                    self.edit_image = cropped_img
+                    
+                    # Ask to save
+                    file_path, _ = QFileDialog.getSaveFileName(
+                        self,
+                        "Save Cropped Image",
+                        "",
+                        "PNG (*.png);;JPEG (*.jpg);;All files (*.*)"
+                    )
+                    
+                    # ...after saving...
+                    if file_path:
+                        msg = QMessageBox(self)
+                        msg.setWindowTitle("Success")
+                        msg.setText(f"Cropped image saved:\n{file_path}")
+                        msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+                        msg.exec()
+        # ...on error...
+        except Exception as e:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText(f"Failed to crop image:\n{str(e)}")
+            msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+            msg.exec()
+
+    def improve_quality(self):
+        if not self.edit_image:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText("Please upload an image first.")
+            msg.setIconPixmap(self.get_accent_icon("warning").pixmap(48, 48))
+            msg.exec()
+            return
+
+        try:
+            # Show loading spinner
+            self.show_loading("Enhancing image quality...")
+            self.statusBar().showMessage("Enhancing image quality, please wait...")
+            # Convert PIL image to OpenCV (numpy) format
+            img = np.array(self.edit_image.convert("RGB"))
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            # Load LapSRN model
+            sr = cv2.dnn_superres.DnnSuperResImpl_create()
+            model_path = "LapSRN_x2.pb"
+            sr.readModel(model_path)
+            sr.setModel("lapsrn", 2)  # scale = 2
+
+            # Apply super resolution
+            result = sr.upsample(img)
+            self.hide_loading()  # Hide spinner after processing
+            # Update stored image
+            self.edit_image = Image.fromarray(result_rgb)
+            # Convert back to PIL for GUI usage
+            result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+            result_pil = Image.fromarray(result_rgb)
+
+            # Show preview
+            preview = result_pil.copy()
+            preview.thumbnail((300, 300))
+            qimage = self.pil_to_qimage(preview)
+            pixmap = QPixmap.fromImage(qimage)
+            self.edit_image_label.setPixmap(pixmap)
+
+            # Save file dialog
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Enhanced Image",
+                "",
+                "PNG (*.png);;JPEG (*.jpg);;All files (*.*)"
+            )
+
+            self.hide_loading()  # Hide spinner after processing
+            # ...after saving...
+            if file_path:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Success")
+                msg.setText(f"Enhanced image saved:\n{file_path}")
+                msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+                msg.exec()
+
+        # ...on error...
+        except Exception as e:
+            self.hide_loading()
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Error")
+            msg.setText(f"Failed to enhance image:\n{str(e)}")
+            msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+            msg.exec()
+            
+
+    def get_downloads_folder(self):
+        if platform.system() == "Windows":
+            return os.path.join(os.environ["USERPROFILE"], "Downloads")
+        elif platform.system() == "Darwin":  # macOS
+            return os.path.join(os.path.expanduser("~"), "Downloads")
+        else:  # Linux and others
+            return os.path.join(os.path.expanduser("~"), "Downloads")
+
+    # Helper to convert PIL Image to QImage
+    def pil_to_qimage(self, pil_image):
+        if pil_image.mode == "RGB":
+            r, g, b = pil_image.split()
+            pil_image = Image.merge("RGB", (b, g, r))
+        elif pil_image.mode == "RGBA":
+            r, g, b, a = pil_image.split()
+            pil_image = Image.merge("RGBA", (b, g, r, a))
+        
+        im_data = pil_image.convert("RGBA").tobytes("raw", "RGBA")
+        qimage = QImage(
+            im_data, pil_image.size[0], pil_image.size[1], 
+            QImage.Format.Format_RGBA8888
+        )
+        return qimage
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        file_paths = []
+        
+        for url in urls:
+            file_path = url.toLocalFile()
+            file_paths.append(file_path)
+        
+        if file_paths:
+            self.process_dropped_files(file_paths)
+    
+    def process_dropped_files(self, file_paths):
+        # Check if files match current mode
+        valid_files = []
+        file_types = []
+        
+        if self.mode == "Image":
+            valid_extensions = SUPPORTED_FORMATS
+        else:
+            valid_extensions = SUPPORTED_VIDEO_FORMATS
+            
+        for path in file_paths:
+            if os.path.isdir(path):
+                # Process directory contents
+                for root, dirs, files in os.walk(path):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        ext = os.path.splitext(file)[1].lower().lstrip('.')
+                        if ext in valid_extensions:
+                            valid_files.append(full_path)
+                            file_types.append(self.mode.lower())
+            else:
+                # Process single file
+                ext = os.path.splitext(path)[1].lower().lstrip('.')
+                if ext in valid_extensions:
+                    valid_files.append(path)
+                    file_types.append(self.mode.lower())
+        
+        if valid_files:
+            self.selected_files = valid_files
+            self.file_types = file_types
+            self.file_count = len(valid_files)
+            self.file_path_input.setText(";".join(valid_files))
+            self.files_label.setText(f"Found {self.file_count} convertible {self.mode.lower()}{'s' if self.file_count != 1 else ''}")
+            self.statusBar().showMessage(f"Ready to convert {self.file_count} {self.mode.lower()}{'s' if self.file_count != 1 else ''}")
+        else:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Invalid Files")
+            msg.setText(f"No valid {self.mode.lower()} files found.")
+            msg.setIconPixmap(self.get_accent_icon("warning").pixmap(48, 48))
+            msg.exec()
+                    
+    def browse_files(self):
+        if self.mode == "Image":
+            filter_str = "Image files (*.jpg *.jpeg *.png *.bmp *.tiff *.webp *.heic);;All files (*.*)"
+        else:
+            filter_str = "Video files (*.mp4 *.avi *.mov *.mkv *.webm);;All files (*.*)"
+        
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, 
+            f"Select {self.mode} Files",
+            "",
+            filter_str
+        )
+        
+        if file_paths:
+            self.process_dropped_files(file_paths)
+
+    def preview_files(self):
+        if not self.selected_files:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Preview")
+            msg.setText("No files selected for preview.")
+            msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+            msg.exec()
+            return
+        
+        # Simple preview dialog showing the first few files
+        preview_dialog = QDialog(self)
+        preview_dialog.setWindowTitle("File Preview")
+        preview_dialog.setMinimumSize(400, 500)
+        
+        layout = QVBoxLayout(preview_dialog)
+        
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        
+        # Keep track of files being removed
+        removed_indices = []
+        
+        # Function to remove a file
+        def remove_file(index):
+            removed_indices.append(index)
+            file_frames[index].setVisible(False)
+            update_count_label()
+        
+        # Update the count label based on remaining files
+        def update_count_label():
+            remaining = len(self.selected_files) - len(removed_indices)
+            count_label.setText(f"Selected files: {remaining}")
+        
+        # Add file count
+        count_label = QLabel(f"Selected files: {len(self.selected_files)}")
+        count_label.setStyleSheet("font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(count_label)
+        
+        file_frames = []
+        
+        # Add all file previews (not just 5)
+        for i, file_path in enumerate(self.selected_files):
+            file_frame = QFrame()
+            file_frames.append(file_frame)
+            file_frame.setFrameShape(QFrame.Shape.StyledPanel)
+            file_layout = QHBoxLayout(file_frame)
+            
+            # File info
+            file_name = os.path.basename(file_path)
+            file_label = QLabel(file_name)
+            file_label.setWordWrap(True)
+            
+            # Try to add a thumbnail for images
+            if self.file_types[i] == "image":
+                try:
+                    img = Image.open(file_path)
+                    img.thumbnail((80, 80))
+                    qimage = self.pil_to_qimage(img)
+                    pixmap = QPixmap.fromImage(qimage)
+                    thumb = QLabel()
+                    thumb.setPixmap(pixmap)
+                    thumb.setFixedSize(80, 80)
+                    file_layout.addWidget(thumb)
+                except:
+                    pass
+            
+            file_layout.addWidget(file_label, 1)
+            
+            # Add remove button
+            remove_btn = QPushButton("❌")
+            remove_btn.setToolTip("Remove from selection")
+            remove_btn.setFixedWidth(30)
+            remove_btn.clicked.connect(lambda checked, idx=i: remove_file(idx))
+            file_layout.addWidget(remove_btn)
+            
+            scroll_layout.addWidget(file_frame)
+        
+        scroll_area.setWidget(scroll_content)
+        layout.addWidget(scroll_area)
+        
+        # Buttons at bottom
+        button_layout = QHBoxLayout()
+        
+        apply_button = StyledButton("Apply Changes", self.theme["accent"])
+        apply_button.clicked.connect(lambda: apply_changes())
+        button_layout.addWidget(apply_button)
+        
+        cancel_button = StyledButton("Cancel", self.theme["accent"])
+        cancel_button.clicked.connect(preview_dialog.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+        
+        def apply_changes():
+            # Remove files in reverse order to avoid index shifting
+            for index in sorted(removed_indices, reverse=True):
+                if 0 <= index < len(self.selected_files):
+                    del self.selected_files[index]
+                    del self.file_types[index]
+            
+            # Update file count
+            self.file_count = len(self.selected_files)
+            
+            # Update file display
+            if self.file_count > 0:
+                self.file_path_input.setText(";".join(self.selected_files))
+                self.files_label.setText(f"Found {self.file_count} convertible {self.mode.lower()}{'s' if self.file_count != 1 else ''}")
+                self.statusBar().showMessage(f"Ready to convert {self.file_count} {self.mode.lower()}{'s' if self.file_count != 1 else ''}")
+            else:
+                self.file_path_input.clear()
+                self.files_label.setText("No files selected")
+                self.statusBar().showMessage("Ready")
+            
+            preview_dialog.accept()
+        
+        # Show the dialog
+        preview_dialog.exec()
+    
+    def update_quality_label(self, value):
+        self.quality_value.setText(f"{value}%")
+
+    def set_mode(self, mode):
+        self.mode = mode
+        
+        if mode == "Image":
+            self.image_button.setChecked(True)
+            self.video_button.setChecked(False)
+            self.format_combo.clear()
+            self.format_combo.addItems(SUPPORTED_FORMATS)
+            self.format_combo.setCurrentText("webp")
+            self.quality_container.setVisible(True)  # Show the container instead of the layout
+            self.time_crop_group.setVisible(False)
+        else:  # Video
+            self.image_button.setChecked(False)
+            self.video_button.setChecked(True)
+            self.format_combo.clear()
+            self.format_combo.addItems(SUPPORTED_VIDEO_FORMATS)
+            self.format_combo.setCurrentText("mp4")
+            self.quality_container.setVisible(False)  # Hide the container instead of the layout
+            self.time_crop_group.setVisible(True)
+
+        # Clear selected files when mode changes
+        self.selected_files = []
+        self.file_types = []
+        self.file_count = 0
+        self.file_path_input.clear()
+        self.files_label.setText("No files selected")
+
+    def toggle_theme(self):
+        if self.theme == DARK_THEME:
+            self.theme = LIGHT_THEME
+            self.save_theme("light")
+            self.theme_button.setText("☀️")
+        else:
+            self.theme = DARK_THEME
+            self.save_theme("dark")
+            self.theme_button.setText("🌙")
+        
         self.apply_theme()
 
-    def show_custom_popup(self, title, message):
-        popup = tk.Toplevel(self.root)
-        popup.title(title)
-        popup.geometry("420x320")
-        popup.resizable(False, False)
-        popup.transient(self.root)
-        popup.grab_set()
+    def apply_theme(self):
         th = self.theme
-        popup.configure(bg=th["bg"])
-        popup.withdraw()
-        popup.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width() - popup.winfo_width()) // 2
-        y = self.root.winfo_rooty() + (self.root.winfo_height() - popup.winfo_height()) // 2
-        popup.geometry(f"+{x}+{y}")
-        popup.deiconify()
+        
+        # App-wide palette
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(th["bg"]))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(th["fg"]))
+        palette.setColor(QPalette.ColorRole.Base, QColor(th["card_bg"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(th["fg"]))
+        palette.setColor(QPalette.ColorRole.Button, QColor(th["bg"]))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(th["fg"]))
+        self.setPalette(palette)
 
-        # Scrollable area
-        canvas = tk.Canvas(popup, bg=th["bg"], highlightthickness=0)
-        scrollbar = tk.Scrollbar(popup, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=th["bg"], padx=20, pady=20)
 
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(
-                scrollregion=canvas.bbox("all")
+         # Update label colors for theme
+        if hasattr(self, "header_label"):
+            self.header_label.setStyleSheet(
+                f"font-size: 16px; font-weight: bold; color: {th['fg']};"
             )
-        )
+        if hasattr(self, "source_header"):
+            self.source_header.setStyleSheet(
+                f"font-weight: bold; color: {th['fg']};"
+            )
+        
+        if hasattr(self, "file_type_label"):
+            self.file_type_label.setStyleSheet(
+                f"font-weight: bold; color: {th['fg']};"
+            )
 
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        if hasattr(self, "tools_label"):
+            self.tools_label.setStyleSheet(
+                f"font-size: 16px; font-weight: bold; color: {th['fg']};"
+            )
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        label = tk.Label(
-            scroll_frame,
-            text=message,
-            bg=th["bg"],
-            fg=th["fg"],
-            font=self.normal_font,
-            justify="left",
-            wraplength=360
-        )
-        label.pack(fill=tk.BOTH, expand=True)
-
-        close_btn = tk.Button(
-            scroll_frame,
-            text="Close",
-            command=popup.destroy,
-            bg=th["accent"],
-            fg="#fff",
-            activebackground=th["accent_hover"],
-            relief=tk.FLAT,
-            padx=20,
-            font=self.normal_font
-        )
-        close_btn.pack(pady=(15, 0))
-
-        # Enable mousewheel scrolling
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        self.root.wait_window(popup)
-
+        
+        # Buttons with accent color
+        accent_style = f"""
+            QPushButton {{
+                background-color: {th["accent"]};
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {th["accent_hover"]};
+            }}
+            QPushButton:checked {{
+                background-color: {th["accent"]};
+                color: white;
+            }}
+            QPushButton:!checked {{
+                background-color: {th["card_bg"]};
+                color: {th["fg"]};
+            }}
+        """
+        
+        # Update styled components
+        self.convert_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {th["accent"]};
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {th["accent_hover"]};
+            }}
+        """)
+        
+        # Mode buttons
+        self.image_button.setStyleSheet(accent_style)
+        self.video_button.setStyleSheet(accent_style)
+        
+        # Input fields
+        input_style = f"""
+            QLineEdit, QComboBox, QSpinBox {{
+                background-color: {th["entry_bg"]};
+                color: {th["fg"]};
+                border: 1px solid {th["border"]};
+                padding: 6px;
+                border-radius: 4px;
+            }}
+        """
+        self.file_path_input.setStyleSheet(input_style)
+        self.format_combo.setStyleSheet(input_style)
+        self.width_input.setStyleSheet(input_style)
+        self.height_input.setStyleSheet(input_style)
+        
+        # Card frames
+        frame_style = f"""
+            QFrame {{
+                background-color: {th["card_bg"]};
+                border: 1px solid {th["border"]};
+                border-radius: 8px;
+            }}
+        """
+        
+        # Slider
+        self.quality_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                border: 1px solid {th["border"]};
+                height: 8px;
+                background: {th["entry_bg"]};
+                margin: 2px 0;
+                border-radius: 4px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {th["accent"]};
+                border: 1px solid {th["accent"]};
+                width: 18px;
+                height: 18px;
+                margin: -8px 0;
+                border-radius: 9px;
+            }}
+        """)
+        
+        # Progress bar
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                border: 1px solid {th["border"]};
+                border-radius: 5px;
+                text-align: center;
+                background-color: {th["entry_bg"]};
+            }}
+            QProgressBar::chunk {{
+                background-color: {th["accent"]};
+                border-radius: 5px;
+            }}
+        """)
+        
+        # Image edit preview area
+        self.edit_image_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {th["card_bg"]};
+                border-radius: 8px;
+                padding: 10px;
+                color: {th["fg"]};
+            }}
+        """)
+    
     def show_privacy(self):
-        self.show_custom_popup(
-            "Privacy",
-            "Privacy Policy\n\n"
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Privacy Policy")  
+        msg.setText("Privacy Policy\n\n"
             "• This application does NOT collect, store, or transmit any personal data.\n"
             "• All image and video processing is performed locally on your device.\n"
             "• No files are uploaded to any server or shared with third parties.\n"
             "• The app does not use cookies, analytics, or tracking technologies.\n"
             "• Your usage and converted files remain private and secure.\n\n"
             "If you have any privacy concerns or questions, please contact:\n"
-            "basharulalammazu6@gmail.com"
-        )
-
+            "basharulalam6@gmail.com")
+        msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+        msg.exec()
+    
     def show_documentation(self):
-        self.show_custom_popup(
-            "Documentation",
-            "🖼️ Image & Video Format Converter for Windows\n"
-            "\n"
-            "Features:\n"
-            "• Convert images between JPG, PNG, BMP, TIFF, WEBP, HEIC\n"
-            "• Convert videos between MP4, AVI, MOV, MKV, WEBM\n"
-            "• Batch processing support\n"
-            "• Dark/light theme toggle\n"
-            "• Drag & drop files or folders\n"
-            "• Resize images/videos by width, height, or both\n"
-            "• Adjustable image quality\n"
-            "• Progress and status indicators\n"
-            "\n"
-            "How to Use:\n"
-            "1. Select images or videos using the Browse button or drag-and-drop.\n"
-            "2. Choose the output format and adjust settings as needed.\n"
-            "3. (Optional) Enable resizing and set dimensions.\n"
-            "4. Click 'Convert' to start the conversion process.\n"
-            "\n"
-            "Other Info:\n"
-            "• Converted files are saved in a new folder next to your originals.\n"
-            "• The app does not collect or share any personal data.\n"
-            "• For support, use the About section to contact the developer.\n"
-            "\n"
-            "Enjoy converting your media files easily!"
-        )
+        # Create a custom dialog
+        doc_dialog = QDialog(self)
+        doc_dialog.setWindowTitle("Documentation")
+        doc_dialog.setMinimumSize(500, 400)  # Set a reasonable size
+        
+        # Main layout for the dialog
+        layout = QVBoxLayout(doc_dialog)
+        
+        # Title label
+        title_label = QLabel("🖼️ Editara Documentation")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {self.theme['fg']}; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+        
+        # Scroll area for documentation text
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        
+        # Documentation text
+        doc_text = QLabel(
+                    "Features:\n"
+                    "• Image Conversion: Convert between JPG, PNG, BMP, TIFF, WEBP, HEIC formats.\n"
+                    "• Video Conversion: Convert between MP4, AVI, MOV, MKV, WEBM formats.\n"
+                    "• Batch Processing: Convert multiple files at once.\n"
+                    "• Resize Options: Resize images or videos by width, height, or both.\n"
+                    "• Image Quality Adjustment: Set quality for image conversions.\n"
+                    "• Video Time Cropping: Specify start and end times for video conversions.\n"
+                    "• Image Editing Tools:\n"
+                    "  - Create passport size images (413x531 pixels).\n"
+                    "  - Remove background from images using GrabCut.\n"
+                    "  - Crop images with interactive selection.\n"
+                    "  - Improve image quality using super-resolution (requires LapSRN_x2.pb model).\n"
+                    "• Theme Toggle: Switch between dark and light themes.\n"
+                    "• Drag & Drop: Easily add files or folders.\n"
+                    "• File Preview: Preview selected files before conversion.\n"
+                    "• Update Checker: Check for the latest version via Settings menu.\n\n"
+                    "How to Use:\n\n"
+                    "1. Conversion:\n"
+                    "   a. Select the file type (Image or Video) using the mode buttons.\n"
+                    "   b. Add files using the Browse button or by dragging and dropping them into the app.\n"
+                    "   c. Choose the output format from the dropdown menu.\n"
+                    "   d. Adjust settings:\n"
+                    "      - For images: Set quality (10-100%) using the slider.\n"
+                    "      - For videos: Set start/end times in the Video Time Range section.\n"
+                    "      - Enable resizing and specify width/height if desired.\n"
+                    "   e. Click 'Convert' to start the process.\n"
+                    "   f. Monitor progress via the progress bar.\n\n"
+                    "2. Image Editing:\n"
+                    "   a. Switch to the 'Image Edit' tab.\n"
+                    "   b. Click 'Upload Image' to select an image.\n"
+                    "   c. Use the tools:\n"
+                    "      - 'Passport Size': Resize to standard passport dimensions.\n"
+                    "      - 'Remove Background': Automatically remove the image background.\n"
+                    "      - 'Crop Image': Select and crop a region interactively.\n"
+                    "      - 'Improve Quality': Enhance resolution (model file required).\n"
+                    "   d. Save the edited image when prompted.\n\n"
+                    "Other Information:\n"
+                    "• Converted files are saved in a 'Converted_to_[format]' folder next to your originals.\n"
+                    "• All processing is local; no data is collected or shared.\n"
+                    "• Check the current version in the About section.\n"
+                    "• For support, contact the developer via the About section.\n\n"
+                    "Requirements:\n"
+                    "• Video conversion is built-in to the EXE version (no extra install needed).\n"
+                    "• Quality improvement requires the 'LapSRN_x2.pb' model file in the app directory."
+                )
 
+
+
+
+
+        doc_text.setStyleSheet(f"color: {self.theme['fg']}; padding: 10px;")
+        doc_text.setWordWrap(True)
+        scroll_layout.addWidget(doc_text)
+        scroll_area.setWidget(scroll_content)
+        
+        # Style the scroll area
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {self.theme['card_bg']};
+                border: 1px solid {self.theme['border']};
+                border-radius: 8px;
+            }}
+            QScrollBar:vertical {{
+                border: none;
+                background: {self.theme['entry_bg']};
+                width: 10px;
+                margin: 0px 0px 0px 0px;
+                border-radius: 5px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {self.theme['accent']};
+                border-radius: 5px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                border: none;
+                background: none;
+            }}
+        """)
+        
+        layout.addWidget(scroll_area)
+        
+        # Close button
+        close_button = StyledButton("Close", self.theme["accent"])
+        close_button.clicked.connect(doc_dialog.accept)
+        layout.addWidget(close_button)
+        
+        # Add icon to the dialog
+        doc_dialog.setWindowIcon(self.get_accent_icon("info"))
+        
+        # Show the dialog
+        doc_dialog.exec()
+
+
+    
     def show_policy(self):
-        self.show_custom_popup(
-            "Policy",
-            "Usage Policy:\n\n"
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Privacy Policy")  # or "Documentation", etc.
+        msg.setText("Usage Policy:\n\n"
             "• This application is provided for personal and internal use only.\n"
             "• Redistribution, modification, or commercial use is strictly prohibited without written permission from the developer.\n"
             "• All conversions are performed locally; no files are uploaded or shared.\n"
             "• By using this app, you agree to the terms described in the LICENSE file.\n"
             "\n"
-            "For permissions or questions, contact: basharulalammazu6@gmail.com"
-        )
-
-    def show_help(self):
-        self.show_custom_popup(
-            "Help",
-            "How to use:\n\n"
-            "1. Select images or videos using the Browse button or drag-and-drop.\n"
-            "2. Choose the output format and adjust settings as needed.\n"
-            "3. Click 'Convert' to start the conversion process.\n\n"
-            "For more details, see the README.md file."
-        )
-
-    def center_window(self):
-        self.root.update_idletasks()
-        window_width = self.root.winfo_width()
-        window_height = self.root.winfo_height()
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = (screen_width - window_width) // 2
-        y = (screen_height - window_height) // 2
-        self.root.geometry(f"+{x}+{y}")
-
-    def setup_ui(self):
-        self.root.title("🖼️ Image Format Converter")
-        self.root.geometry("600x600")
-        self.root.minsize(550, 550)
-
-        # Main content frame
-        self.main_frame = tk.Frame(self.root)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
-
-        # Header frame (title, theme, info)
-        self.header_frame = tk.Frame(self.main_frame, bg=self.theme["bg"])
-        self.header_frame.pack(fill=tk.X, pady=(0, 10))
-        self.app_title = tk.Label(
-            self.header_frame, text="Image Format Converter", font=self.heading_font,
-            bg=self.theme["bg"], fg=self.theme["fg"]
-        )
-        self.app_title.pack(side=tk.LEFT)
-        self.theme_button = tk.Button(
-            self.header_frame, text="🌙", width=3, command=self.toggle_theme,
-            relief=tk.FLAT, font=self.normal_font, bg=self.theme["accent"], fg="#fff",
-            activebackground=self.theme["accent_hover"]
-        )
-
-        self.theme_button.pack(side=tk.RIGHT, padx=(0, 5))
-
-        # Check for updates button
-        self.update_button = tk.Button(
-            self.header_frame,
-            text="⬆️",
-            width=3,
-            command=self.check_for_update,
-            relief=tk.FLAT,
-            font=self.normal_font
-        )
-        self.update_button.pack(side=tk.RIGHT, padx=(0, 5))
-         
-         
-        self.info_button = tk.Button(
-            self.header_frame, text="ℹ️", width=3, command=self.show_about,
-            relief=tk.FLAT, font=self.normal_font, bg=self.theme["accent"], fg="#fff",
-            activebackground=self.theme["accent_hover"]
-        )
-        self.info_button.pack(side=tk.RIGHT, padx=(0, 5))
-
-        # --- Source folder selection card (FIRST) ---
-        self.source_card = tk.Frame(self.main_frame, relief=tk.RIDGE, bd=1)
-        self.source_card.pack(fill=tk.X, pady=10)
-        self.source_inner = tk.Frame(self.source_card)
-        self.source_inner.pack(fill=tk.X, padx=15, pady=15)
-        self.source_header = tk.Label(
-            self.source_inner, text="Source Folder", anchor='w', font=self.normal_font
-        )
-        self.source_header.pack(fill=tk.X)
-        self.folder_frame = tk.Frame(self.source_inner)
-        self.folder_frame.pack(fill=tk.X, pady=(10, 0))
-        self.entry = tk.Entry(
-            self.folder_frame, textvariable=self.folder_var, font=self.normal_font,
-            relief=tk.FLAT, bd=1
-        )
-        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=(0, 10))
-        self.entry.drop_target_register(DND_FILES)
-        self.entry.dnd_bind('<<Drop>>', self.drop_folder)
-        self.browse_button = tk.Button(
-            self.folder_frame, text="Browse", command=self.browse_folder,
-            relief=tk.FLAT, padx=12, font=self.normal_font
-        )
-        self.browse_button.pack(side=tk.RIGHT)
-        self.preview_button = tk.Button(
-            self.folder_frame, text="Preview", command=self.preview_selected_file,
-            relief=tk.FLAT, padx=12, font=self.normal_font
-        )
-        self.preview_button.pack(side=tk.RIGHT, padx=(0, 10))
-        self.drop_label = tk.Label(
-            self.source_inner, text="✨ Drag and drop a folder or image/video files here",
-            font=self.small_font
-        )
-        self.drop_label.pack(anchor='w', pady=(5, 0))
-        self.files_label = tk.Label(
-            self.source_inner, text="No folder selected", font=self.small_font, anchor='w'
-        )
-        self.files_label.pack(fill=tk.X, pady=(5, 0))
-
-        # --- Settings card and inner frame (SECOND) ---
-        self.settings_card = tk.Frame(self.main_frame, relief=tk.RIDGE, bd=1)
-        self.settings_card.pack(fill=tk.X, pady=10)
-        self.settings_inner = tk.Frame(self.settings_card)
-        self.settings_inner.pack(fill=tk.X, padx=15, pady=15)
-
-        # Section switch buttons (Image/Video) on the right
-        self.section_btn_frame = tk.Frame(self.settings_inner, bg=self.theme["bg"])
-        self.section_btn_frame.pack(fill=tk.X, pady=(0, 10), anchor='e')
-        self.image_btn = tk.Button(
-            self.section_btn_frame, text="Image", width=8,
-            command=lambda: self.set_mode("Image"),
-            font=self.normal_font, relief=tk.RAISED, bg=self.theme["accent"], fg="#fff",
-            activebackground=self.theme["accent_hover"]
-        )
-        self.image_btn.pack(side=tk.RIGHT, padx=(0, 5))
-        self.video_btn = tk.Button(
-            self.section_btn_frame, text="Video", width=8,
-            command=lambda: self.set_mode("Video"),
-            font=self.normal_font, relief=tk.RAISED, bg=self.theme["card_bg"], fg=self.theme["fg"],
-            activebackground=self.theme["hover"]
-        )
-        self.video_btn.pack(side=tk.RIGHT, padx=(0, 5))
-
-        # Settings header
-        self.settings_header = tk.Label(
-            self.settings_inner, text="Conversion Settings", anchor='w', font=self.normal_font
-        )
-        self.settings_header.pack(fill=tk.X, pady=(0, 10))
-
-        # Format settings row
-        self.format_frame = tk.Frame(self.settings_inner)
-        self.format_frame.pack(fill=tk.X, pady=5)
-        self.format_label = tk.Label(self.format_frame, text="Output Format:", width=15, anchor='w')
-        self.format_label.pack(side=tk.LEFT)
-        self.format_dropdown = ttk.Combobox(
-            self.format_frame, textvariable=self.format_var,
-            values=SUPPORTED_FORMATS, width=15, state='readonly'
-        )
-        self.format_dropdown.pack(side=tk.LEFT, padx=(0, 15))
-
-        # Quality settings row (only for images)
-        self.quality_frame = tk.Frame(self.settings_inner)
-        self.quality_frame.pack(fill=tk.X, pady=5)
-        self.quality_label = tk.Label(self.quality_frame, text="Image Quality:", width=15, anchor='w')
-        self.quality_label.pack(side=tk.LEFT)
-        self.quality_slider = ttk.Scale(
-            self.quality_frame, from_=10, to=100, orient=tk.HORIZONTAL,
-            variable=self.quality_var, command=self.update_quality_label
-        )
-        self.quality_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        self.quality_value_label = tk.Label(self.quality_frame, text="90%", width=5)
-        self.quality_value_label.pack(side=tk.RIGHT)
-
-        # Resize settings
-        self.resize_frame = tk.Frame(self.settings_inner)
-        self.resize_frame.pack(fill=tk.X, pady=5)
-        self.resize_check = tk.Checkbutton(
-            self.resize_frame, text="Resize", variable=self.resize_var,
-            command=self.update_resize_options, font=self.normal_font
-        )
-        self.resize_check.pack(anchor='w')
-        self.resize_options_frame = tk.Frame(self.resize_frame)
-        self.resize_options_frame.pack(fill=tk.X, padx=(20, 0))
-        self.width_radio = tk.Radiobutton(
-            self.resize_options_frame, text="Specify Width", variable=self.resize_mode_var,
-            value="width", font=self.normal_font
-        )
-        self.width_radio.pack(anchor='w')
-        self.height_radio = tk.Radiobutton(
-            self.resize_options_frame, text="Specify Height", variable=self.resize_mode_var,
-            value="height", font=self.normal_font
-        )
-        self.height_radio.pack(anchor='w')
-        self.both_radio = tk.Radiobutton(
-            self.resize_options_frame, text="Specify Both", variable=self.resize_mode_var,
-            value="both", font=self.normal_font
-        )
-        self.both_radio.pack(anchor='w')
-        self.width_label = tk.Label(self.resize_options_frame, text="Width:", font=self.normal_font)
-        self.width_label.pack(side=tk.LEFT, padx=(0, 5))
-        self.width_entry = tk.Entry(self.resize_options_frame, textvariable=self.width_var, width=10, font=self.normal_font)
-        self.width_entry.pack(side=tk.LEFT, padx=(0, 10))
-        self.height_label = tk.Label(self.resize_options_frame, text="Height:", font=self.normal_font)
-        self.height_label.pack(side=tk.LEFT, padx=(0, 5))
-        self.height_entry = tk.Entry(self.resize_options_frame, textvariable=self.height_var, width=10, font=self.normal_font)
-        self.height_entry.pack(side=tk.LEFT)
-        self.resize_options_frame.pack_forget()
-
-        # Video crop time (only for videos) - created ONCE here
-        self.crop_time_frame = tk.Frame(self.settings_inner)
-        self.start_label = tk.Label(self.crop_time_frame, text="Start Time (s):", width=15, anchor='w')
-        self.start_label.pack(side=tk.LEFT)
-        self.start_time_var = tk.StringVar()
-        self.start_entry = tk.Entry(self.crop_time_frame, textvariable=self.start_time_var, width=10, font=self.normal_font)
-        self.start_entry.pack(side=tk.LEFT, padx=(0, 10))
-        self.end_label = tk.Label(self.crop_time_frame, text="End Time (s):", width=15, anchor='w')
-        self.end_label.pack(side=tk.LEFT)
-        self.end_time_var = tk.StringVar()
-        self.end_entry = tk.Entry(self.crop_time_frame, textvariable=self.end_time_var, width=10, font=self.normal_font)
-        self.end_entry.pack(side=tk.LEFT)
-        self.crop_time_frame.pack_forget()  # Hide by default
-
-        # Action area
-        self.action_frame = tk.Frame(self.main_frame)
-        self.action_frame.pack(fill=tk.X, pady=10)
-        self.progress_var = tk.DoubleVar()
-        self.progress = ttk.Progressbar(
-            self.action_frame, orient=tk.HORIZONTAL, length=100, mode='determinate',
-            variable=self.progress_var
-        )
-        self.progress.pack(fill=tk.X, pady=(0, 10))
-        self.convert_button = tk.Button(
-            self.action_frame, text="🚀 Convert", command=self.start_conversion,
-            relief=tk.FLAT, font=("Segoe UI", 13, "bold"), padx=10, pady=10,
-            height=2, width=5, bg=self.theme["accent"], fg="#ffffff",
-            activebackground=self.theme["accent_hover"], cursor="hand2"
-        )
-        self.convert_button.pack(fill=tk.X)
-        self.status_var = tk.StringVar(value="Ready")
-        self.status_bar = tk.Label(
-            self.main_frame, textvariable=self.status_var, bd=1, relief=tk.SUNKEN,
-            anchor=tk.W, font=self.small_font
-        )
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.resize_mode_var.trace('w', self.update_resize_entries)
-        self.update_resize_entries()
-        self.update_mode()
-
-
-
-    def update_resize_options(self):
-        if self.resize_var.get():
-            self.resize_options_frame.pack(fill=tk.X, padx=(20, 0))
-        else:
-            self.resize_options_frame.pack_forget()
-
-    def update_resize_entries(self, *args):
-        mode = self.resize_mode_var.get()
-        if mode == "width":
-            self.width_entry.config(state='normal')
-            self.height_entry.config(state='readonly')
-        elif mode == "height":
-            self.width_entry.config(state='readonly')
-            self.height_entry.config(state='normal')
-        elif mode == "both":
-            self.width_entry.config(state='normal')
-            self.height_entry.config(state='normal')
-
-    def set_mode(self, mode):
-        self.mode_var.set(mode)
-        self.update_mode()
-        # Highlight the active button
-        if mode == "Image":
-            self.image_btn.config(bg=self.theme["accent"], fg="#fff", relief=tk.SUNKEN)
-            self.video_btn.config(bg=self.theme["card_bg"], fg=self.theme["fg"], relief=tk.RAISED)
-        else:
-            self.video_btn.config(bg=self.theme["accent"], fg="#fff", relief=tk.SUNKEN)
-            self.image_btn.config(bg=self.theme["card_bg"], fg=self.theme["fg"], relief=tk.RAISED)
-
-
-    def update_mode(self, event=None):
-        mode = self.mode_var.get()
-        if mode == "Image":
-            self.format_dropdown['values'] = SUPPORTED_FORMATS
-            self.format_var.set(SUPPORTED_FORMATS[0])
-            self.quality_frame.pack(fill=tk.X, pady=5)
-            self.resize_check.config(text="Resize Image")
-            self.crop_time_frame.pack_forget()  # Hide crop time frame
-        else:
-            self.format_dropdown['values'] = SUPPORTED_VIDEO_FORMATS
-            self.format_var.set(SUPPORTED_VIDEO_FORMATS[0])
-            self.quality_frame.forget()
-            self.resize_check.config(text="Resize Video")
-            self.crop_time_frame.pack(fill=tk.X, pady=5)  # Show crop time frame
-
-        # Revalidate selected files when mode changes
-        if hasattr(self, 'selected_files') and self.selected_files:
-            self.update_file_info(self.folder_var.get().split(';') if ';' in self.folder_var.get() else self.folder_var.get())
-
-
-
-    def browse_folder(self):
-        mode = self.mode_var.get()
-        if mode == "Image":
-            filetypes = [("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp *.heic"), ("All files", "*.*")]
-            allowed_exts = SUPPORTED_FORMATS
-        else:
-            filetypes = [("Video files", "*.mp4 *.avi *.mov *.mkv *.webm"), ("All files", "*.*")]
-            allowed_exts = SUPPORTED_VIDEO_FORMATS
-        files = filedialog.askopenfilenames(title=f"Select {mode}s", filetypes=filetypes)
-        if files:
-            # Check file extensions
-            for f in files:
-                ext = os.path.splitext(f)[1].lower().lstrip('.')
-                if ext not in allowed_exts:
-                    self.show_custom_popup("Invalid File", f"{os.path.basename(f)} is not a supported {mode.lower()} file.")
-                    return
-            self.folder_var.set(";".join(files))
-            self.file_types = [mode.lower()] * len(files)  # Store file types
-            self.update_file_info(files)
-        else:
-            folder = filedialog.askdirectory()
-            if folder:
-                self.folder_var.set(folder)
-                self.update_file_info(folder)
-
+            "For permissions or questions, contact: basharulalammazu6@gmail.com")
+        msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+        msg.exec()
     
-    def drop_folder(self, event):
-        mode = self.mode_var.get()
-        allowed_exts = SUPPORTED_FORMATS if mode == "Image" else SUPPORTED_VIDEO_FORMATS
-        paths = self.root.tk.splitlist(event.data)
-        valid_paths = []
-        for path in paths:
-            path = path.strip("{").strip("}")
-            if os.path.isdir(path):
-                valid_paths.append(path)
-            elif os.path.isfile(path):
-                ext = os.path.splitext(path)[1].lower().lstrip('.')
-                if ext in allowed_exts:
-                    valid_paths.append(path)
-                else:
-                    self.show_custom_popup("Invalid File", f"{os.path.basename(path)} is not a supported {mode.lower()} file.")
-                    return
-        if valid_paths:
-            self.folder_var.set(";".join(valid_paths))
-            self.file_types = [mode.lower()] * len(valid_paths)
-            self.update_file_info(valid_paths)
-        else:
-            self.show_custom_popup("Invalid Drop", f"Please drop valid {mode.lower()} files or folders.")
+    
+    def show_help(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Help")
+        msg.setText(
+            "How to use Editara:\n\n"
+            "1. Converter Tab:\n"
+            "   - Select 'Image' or 'Video' mode.\n"
+            "   - Add files via Browse or drag-and-drop.\n"
+            "   - Set output format and settings (quality, resize, etc.).\n"
+            "   - Click 'Convert' to process.\n"
+            "2. Image Edit Tab:\n"
+            "   - Upload an image and use tools like passport size, background removal, crop, or quality enhancement.\n"
+            "   - Save your edits.\n\n"
+            "For detailed instructions, see the Documentation section."
+        )
+        msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+        msg.exec()
 
-    def update_file_info(self, paths):
-        mode = self.mode_var.get()
-        formats = SUPPORTED_FORMATS if mode == "Image" else SUPPORTED_VIDEO_FORMATS
-        files = []
-        file_types = []
-        if isinstance(paths, str):
-            if os.path.isdir(paths):
-                for filename in os.listdir(paths):
-                    file_path = os.path.join(paths, filename)
-                    if os.path.isfile(file_path):
-                        ext = os.path.splitext(filename)[1].lower()[1:]
-                        if ext in formats:
-                            files.append(file_path)
-                            file_types.append(mode.lower())
-            elif os.path.isfile(paths):
-                ext = os.path.splitext(paths)[1].lower()[1:]
-                if ext in formats:
-                    files.append(paths)
-                    file_types.append(mode.lower())
-        else:
-            for path in paths:
-                if os.path.isdir(path):
-                    for filename in os.listdir(path):
-                        file_path = os.path.join(path, filename)
-                        if os.path.isfile(file_path):
-                            ext = os.path.splitext(filename)[1].lower()[1:]
-                            if ext in formats:
-                                files.append(file_path)
-                                file_types.append(mode.lower())
-                elif os.path.isfile(path):
-                    ext = os.path.splitext(path)[1].lower()[1:]
-                    if ext in formats:
-                        files.append(path)
-                        file_types.append(mode.lower())
-        self.file_count = len(files)
-        self.file_types = file_types  # Update stored file types
-        if self.file_count > 0:
-            self.files_label.config(text=f"Found {self.file_count} convertible {mode.lower()}{'s' if self.file_count != 1 else ''}")
-            self.status_var.set(f"Ready to convert {self.file_count} {mode.lower()}{'s' if self.file_count != 1 else ''}")
-        else:
-            self.files_label.config(text=f"No convertible {mode.lower()}s found")
-            self.status_var.set(f"No {mode.lower()}s to convert")
-        self.selected_files = files
-
-    def update_quality_label(self, *args):
-        self.quality_value_label.config(text=f"{self.quality_var.get():.0f}%")
-
-    def toggle_theme(self):
-        if self.theme == DARK_THEME:
-            self.theme = LIGHT_THEME
-            ImageConverterApp.save_theme("light")
-        else:
-            self.theme = DARK_THEME
-            ImageConverterApp.save_theme("dark")
-        self.apply_theme()
 
     def show_about(self):
-        about_window = tk.Toplevel(self.root)
-        about_window.title("About Developer")
-        about_window.geometry("320x220")
-        about_window.resizable(False, False)
-        about_window.transient(self.root)
-        about_window.grab_set()
-        th = self.theme
-        about_window.configure(bg=th["bg"])
-        about_window.withdraw()
-        about_window.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width() - about_window.winfo_width()) // 2
-        y = self.root.winfo_rooty() + (self.root.winfo_height() - about_window.winfo_height()) // 2
-        about_window.geometry(f"+{x}+{y}")
-        about_window.deiconify()
-        content_frame = tk.Frame(about_window, bg=th["bg"], padx=20, pady=20)
-        content_frame.pack(fill=tk.BOTH, expand=True)
-        title_frame = tk.Frame(content_frame, bg=th["bg"])
-        title_frame.pack(fill=tk.X, pady=(0, 15))
-        title_label = tk.Label(
-            title_frame, 
-            text="🧑‍💻 Developer Information", 
-            font=self.heading_font,
-            bg=th["bg"],
-            fg=th["fg"]
-        )
-        title_label.pack()
-        info_frame = tk.Frame(content_frame, bg=th["bg"])
-        info_frame.pack(fill=tk.BOTH, expand=True)
-        name_label = tk.Label(info_frame, text="Name:", width=10, anchor='e', bg=th["bg"], fg=th["fg"])
-        name_label.grid(row=0, column=0, sticky='e', pady=3)
-        name_value = tk.Label(info_frame, text="Basharul - Alam - Mazu", anchor='w', bg=th["bg"], fg=th["fg"])
-        name_value.grid(row=0, column=1, sticky='w', pady=3)
-        github_label = tk.Label(info_frame, text="GitHub:", width=10, anchor='e', bg=th["bg"], fg=th["fg"])
-        github_label.grid(row=1, column=0, sticky='e', pady=3)
-        github_value = tk.Label(
-            info_frame,
-            text="basharulalammazu",
-            anchor='w',
-            bg=th["bg"],
-            fg=th["accent"],
-            cursor="hand2"
-        )
-        github_value.grid(row=1, column=1, sticky='w', pady=3)
-        github_value.bind("<Button-1>", lambda e: os.startfile("https://github.com/basharulalammazu"))
-        github_value.grid(row=1, column=1, sticky='w', pady=3)
-        web_label = tk.Label(info_frame, text="Website:", width=10, anchor='e', bg=th["bg"], fg=th["fg"])
-        web_label.grid(row=2, column=0, sticky='e', pady=3)
-        web_value = tk.Label(info_frame, text="basharulalammazu.github.io", anchor='w', 
-                            bg=th["bg"], fg=th["accent"], cursor="hand2")
-        web_value.grid(row=2, column=1, sticky='w', pady=3)
-        web_value.bind("<Button-1>", lambda e: os.startfile("https://basharulalammazu.github.io"))
-        email_label = tk.Label(info_frame, text="Email:", width=10, anchor='e', bg=th["bg"], fg=th["fg"])
-        email_label.grid(row=3, column=0, sticky='e', pady=3)
-        email_value = tk.Label(info_frame, text="basharulalammazu6@gmail.com", anchor='w', 
-                            bg=th["bg"], fg=th["accent"], cursor="hand2")
-        email_value.grid(row=3, column=1, sticky='w', pady=3)
-        email_value.bind("<Button-1>", lambda e: os.startfile("mailto:basharulalammazu6@gmail.com"))
-        close_button = tk.Button(
-            content_frame, 
-            text="Close", 
-            command=about_window.destroy,
-            bg=th["accent"],
-            fg="#ffffff",
-            activebackground=th["accent_hover"],
-            activeforeground="#ffffff",
-            relief=tk.FLAT,
-            padx=20,
-            font=self.normal_font
-        )
-        close_button.pack(pady=(15, 0))
-        self.root.wait_window(about_window)
-
-    def apply_theme(self):
-        th = self.theme
-        self.root.configure(bg=th["bg"])
-        self.main_frame.configure(bg=th["bg"])
-        if self.theme == DARK_THEME:
-            self.theme_button.configure(text="🌙")
-        else:
-            self.theme_button.configure(text="☀️")
-        for frame in [
-            self.main_frame, self.source_card, self.source_inner, self.folder_frame, 
-            self.settings_card, self.settings_inner, self.format_frame, self.quality_frame, 
-            self.resize_frame, self.resize_options_frame, self.action_frame
-        ]:
-            frame.configure(bg=th["bg"])
-        for label in [
-            self.app_title, self.source_header, self.drop_label, self.files_label, 
-            self.settings_header, self.format_label, self.quality_label, self.quality_value_label,
-            self.status_bar, self.width_label, self.height_label
-        ]:
-            label.configure(bg=th["bg"], fg=th["fg"])
-        for card in [self.source_card, self.settings_card]:
-            card.configure(bg=th["card_bg"], highlightbackground=th["border"])
-        self.entry.configure(
-            bg=th["entry_bg"], 
-            fg=th["fg"], 
-            insertbackground=th["fg"],
-            highlightbackground=th["border"]
-        )
-        button_config = {
-            'bg': th["accent"], 
-            'fg': '#ffffff', 
-            'activebackground': th["accent_hover"],
-            'activeforeground': '#ffffff'
-        }
-        self.browse_button.configure(**button_config)
-        self.convert_button.configure(**button_config)
-        self.theme_button.configure(**button_config)
-        self.info_button.configure(**button_config)
-        # Section buttons (Image/Video)
-        if hasattr(self, "image_btn") and hasattr(self, "video_btn"):
-            if self.mode_var.get() == "Image":
-                self.image_btn.config(bg=th["accent"], fg="#fff", relief=tk.SUNKEN)
-                self.video_btn.config(bg=th["card_bg"], fg=th["fg"], relief=tk.RAISED)
-            else:
-                self.video_btn.config(bg=th["accent"], fg="#fff", relief=tk.SUNKEN)
-                self.image_btn.config(bg=th["card_bg"], fg=th["fg"], relief=tk.RAISED)
-        style = ttk.Style()
-        style.theme_use('default')
-        style.configure("TCombobox", 
-                        fieldbackground=th["entry_bg"],
-                        background=th["bg"],
-                        foreground=th["fg"])
-        style.configure("TProgressbar", 
-                        background=th["accent"],
-                        troughcolor=th["entry_bg"])
-        style.configure("Horizontal.TScale",
-                        background=th["bg"],
-                        troughcolor=th["entry_bg"])
+        about_dialog = QDialog(self)
+        about_dialog.setWindowTitle("About Developer")
+        about_dialog.setFixedSize(400, 250)
         
-
-    def show_splash(root, logo_path="logo.png", duration=2000):
-        splash = tk.Toplevel(root)
-        splash.overrideredirect(True)
-        splash.configure(bg="#ffffff")
-        try:
-            pil_img = Image.open(resource_path(logo_path)).resize((50, 50), Image.LANCZOS)
-            img = ImageTk.PhotoImage(pil_img)
-            label = tk.Label(splash, image=img, bg="#ffffff")
-            label.image = img  # Keep a reference!
-            label.pack(padx=20, pady=20)
-        except Exception as e:
-            label = tk.Label(splash, text="Loading...", bg="#ffffff", font=("Segoe UI", 16))
-            label.pack(padx=20, pady=20)
-
-        # Center splash
-        splash.update_idletasks()
-        w, h = splash.winfo_width(), splash.winfo_height()
-        sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
-        x, y = (sw - w) // 2, (sh - h) // 2
-        splash.geometry(f"+{x}+{y}")
-
-        # Hide main window during splash
-        root.withdraw()
-        # After duration, destroy splash and show main window
-        root.after(duration, lambda: (splash.destroy(), root.deiconify()))
-
-
-    def preview_selected_file(self):
-        files = getattr(self, "selected_files", None)
-        if not files or len(files) == 0:
-            self.show_custom_popup("Preview", "No files selected for preview.")
-            return
-
-        preview_win = tk.Toplevel(self.root)
-        preview_win.title("Preview Selected Files")
-        preview_win.geometry("520x480")
-        preview_win.resizable(False, False)
-        th = self.theme
-        preview_win.configure(bg=th["bg"])
-
-        # Scrollable canvas
-        canvas = tk.Canvas(preview_win, bg=th["bg"], highlightthickness=0, width=500, height=400)
-        scrollbar = tk.Scrollbar(preview_win, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=th["bg"])
-
-        def on_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        scroll_frame.bind("<Configure>", on_configure)
-
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # Store references to images and progress bars
-        self._preview_imgs = []
-        self._file_progress_bars = {}
-
-        def remove_file(idx):
-            del self.selected_files[idx]
-            del self.file_types[idx]
-            preview_win.destroy()
-            self.update_file_info(self.selected_files)
-            self.preview_selected_file()  # Reopen preview with updated list
-
-        for idx, file_path in enumerate(self.selected_files):
-            ext = os.path.splitext(file_path)[1].lower()
-            frame = tk.Frame(scroll_frame, bg=th["bg"], pady=10)
-            frame.pack(fill=tk.X, padx=10, pady=5)
-
-            # Thumbnail
-            try:
-                if ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp", ".heic"]:
-                    from PIL import ImageTk
-                    img = Image.open(file_path)
-                    img.thumbnail((120, 120))
-                    img_tk = ImageTk.PhotoImage(img)
-                    self._preview_imgs.append(img_tk)
-                    img_label = tk.Label(frame, image=img_tk, bg=th["bg"])
-                    img_label.pack(side=tk.LEFT, padx=10)
-                elif ext in [".mp4", ".avi", ".mov", ".mkv", ".webm"] and MOVIEPY_AVAILABLE:
-                    from PIL import ImageTk
-                    clip = VideoFileClip(file_path)
-                    frame_img = Image.fromarray(clip.get_frame(0))
-                    frame_img.thumbnail((120, 120))
-                    img_tk = ImageTk.PhotoImage(frame_img)
-                    self._preview_imgs.append(img_tk)
-                    img_label = tk.Label(frame, image=img_tk, bg=th["bg"])
-                    img_label.pack(side=tk.LEFT, padx=10)
-                    clip.close()
-                else:
-                    img_label = tk.Label(frame, text="(No Preview)", bg=th["bg"], fg=th["fg"])
-                    img_label.pack(side=tk.LEFT, padx=10)
-            except Exception as e:
-                img_label = tk.Label(frame, text="(Error)", bg=th["bg"], fg=th["fg"])
-                img_label.pack(side=tk.LEFT, padx=10)
-
-            # File name and remove button
-            info_frame = tk.Frame(frame, bg=th["bg"])
-            info_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            name_label = tk.Label(info_frame, text=os.path.basename(file_path), bg=th["bg"], fg=th["fg"], anchor="w", font=self.normal_font)
-            name_label.pack(anchor="w", padx=5)
-            remove_btn = tk.Button(
-                info_frame, text="Remove", command=lambda i=idx: remove_file(i),
-                bg=th["accent"], fg="#fff", activebackground=th["accent_hover"],
-                relief=tk.FLAT, padx=10, font=self.small_font
-            )
-            remove_btn.pack(anchor="w", pady=5, padx=5)
-
-            # Per-file progress bar
-            file_progress = tk.DoubleVar()
-            progress_bar = ttk.Progressbar(
-                info_frame, orient=tk.HORIZONTAL, length=200, mode='determinate', variable=file_progress
-            )
-            progress_bar.pack(anchor="w", pady=2, padx=5)
-            self._file_progress_bars[file_path] = file_progress
-
-        close_btn = tk.Button(
-            preview_win, text="Close", command=preview_win.destroy,
-            bg=th["accent"], fg="#fff", activebackground=th["accent_hover"],
-            relief=tk.FLAT, padx=20, font=self.normal_font
-        )
-        close_btn.pack(pady=10)
-
+        layout = QVBoxLayout(about_dialog)
         
-
-
-    def preview_image(self, file_path):
-        from PIL import ImageTk
-        try:
-            img = Image.open(file_path)
-            img.thumbnail((400, 400))
-            img_tk = ImageTk.PhotoImage(img)
-            win = tk.Toplevel(self.root)
-            win.title("Image Preview")
-            win.resizable(False, False)
-            label = tk.Label(win, image=img_tk)
-            label.image = img_tk
-            label.pack(padx=10, pady=10)
-            close_btn = tk.Button(win, text="Close", command=win.destroy)
-            close_btn.pack(pady=(0, 10))
-        except Exception as e:
-            self.show_custom_popup("Preview Error", f"Could not preview image:\n{e}")
-
-    def preview_video(self, file_path):
-        if not MOVIEPY_AVAILABLE:
-            self.show_custom_popup("Preview Error", "moviepy is not installed. Please run:\npip install moviepy")
-            return
-        from PIL import ImageTk
-        try:
-            clip = VideoFileClip(file_path)
-            frame = clip.get_frame(0)  # Get first frame
-            img = Image.fromarray(frame)
-            img.thumbnail((400, 400))
-            img_tk = ImageTk.PhotoImage(img)
-            win = tk.Toplevel(self.root)
-            win.title("Video Preview (First Frame)")
-            win.resizable(False, False)
-            label = tk.Label(win, image=img_tk)
-            label.image = img_tk
-            label.pack(padx=10, pady=10)
-            close_btn = tk.Button(win, text="Close", command=win.destroy)
-            close_btn.pack(pady=(0, 10))
-            clip.close()
-        except Exception as e:
-            self.show_custom_popup("Preview Error", f"Could not preview video:\n{e}")
+        title_label = QLabel("🧑‍💻 Developer Information")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 15px;")
+        layout.addWidget(title_label)
+        
+        info_layout = QGridLayout()
+        
+        info_layout.addWidget(QLabel("Name:"), 0, 0)
+        info_layout.addWidget(QLabel("Basharul - Alam - Mazu"), 0, 1)
+        
+        info_layout.addWidget(QLabel("GitHub:"), 1, 0)
+        github_link = QLabel("<a href='https://github.com/basharulalammazu'>basharulalammazu</a>")
+        github_link.setOpenExternalLinks(True)
+        info_layout.addWidget(github_link, 1, 1)
+        
+        info_layout.addWidget(QLabel("Website:"), 2, 0)
+        website_link = QLabel("<a href='https://basharulalammazu.github.io'>basharulalammazu.github.io</a>")
+        website_link.setOpenExternalLinks(True)
+        info_layout.addWidget(website_link, 2, 1)
+        
+        info_layout.addWidget(QLabel("Email:"), 3, 0)
+        email_link = QLabel("<a href='mailto:basharulalammazu6@gmail.com'>basharulalammazu6@gmail.com</a>")
+        email_link.setOpenExternalLinks(True)
+        info_layout.addWidget(email_link, 3, 1)
+        
+        layout.addLayout(info_layout)
+        layout.addStretch(1)
+        
+        close_button = StyledButton("Close", self.theme["accent"])
+        close_button.clicked.connect(about_dialog.accept)
+        layout.addWidget(close_button)
+        
+        about_dialog.exec()
 
     def start_conversion(self):
         if self.is_converting:
             return
-        mode = self.mode_var.get()
-        fmt = self.format_var.get().lower()
-        quality = self.quality_var.get()
-        files = getattr(self, "selected_files", None)
-        if not files or len(files) == 0:
-            self.show_custom_popup("Info", f"No {mode.lower()}s to convert in the selected files/folder.")
+        
+        # Check if files are selected
+        if not self.selected_files:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("No Files")
+            msg.setText(f"No {self.mode.lower()}s selected for conversion.")
+            msg.setIconPixmap(self.get_accent_icon("warning").pixmap(48, 48))
+            msg.exec()
             return
-        # Validate file types match the current mode
-        for file_path, file_type in zip(self.selected_files, self.file_types):
-            ext = os.path.splitext(file_path)[1].lower().lstrip('.')
-            if mode == "Image" and file_type == "video":
-                self.show_custom_popup("Error", "Images cannot be converted to video formats.")
-                return
-            if mode == "Video" and file_type == "image":
-                self.show_custom_popup("Error", "Videos cannot be converted to image formats.")
-                return
-        if mode == "Image" and fmt not in SUPPORTED_FORMATS:
-            self.show_custom_popup("Error", "Invalid image format selected.")
-            return
-        if mode == "Video":
-            if not MOVIEPY_AVAILABLE:
-                self.show_custom_popup("Error", "moviepy is not installed. Please run:\npip install moviepy")
-                return
-            if fmt not in SUPPORTED_VIDEO_FORMATS:
-                self.show_custom_popup("Error", "Invalid video format selected.")
-                return
-        # Validate resize inputs if resize is enabled
-        if self.resize_var.get():
-            resize_mode = self.resize_mode_var.get()
-            if resize_mode in ["width", "both"] and not self.width_var.get().isdigit():
-                self.show_custom_popup("Invalid Input", "Please enter a valid width.")
-                return
-            if resize_mode in ["height", "both"] and not self.height_var.get().isdigit():
-                self.show_custom_popup("Invalid Input", "Please enter a valid height.")
-                return
+        
+        # Get output format
+        output_format = self.format_combo.currentText()
+        
+        # Get quality setting for images
+        quality = self.quality_slider.value() if self.mode == "Image" else None
+        
+        # Check resize settings
+        resize_enabled = self.resize_group.isChecked()
+        
+        # Start conversion
         self.is_converting = True
-        self.convert_button.config(state=tk.DISABLED)
-        self.status_var.set(f"Converting {mode.lower()}s...")
-        self.progress_var.set(0)
-        if mode == "Image":
-            thread = threading.Thread(target=self.run_conversion, args=(files, fmt, quality))
+        self.progress_bar.setValue(0)
+        self.convert_button.setEnabled(False)
+        self.statusBar().showMessage(f"Converting {self.mode.lower()}s...")
+        
+        # Start conversion in a worker thread
+        if self.mode == "Image":
+            self.conversion_worker = Worker(
+                self.convert_images,
+                (self.selected_files, output_format, quality, resize_enabled)
+            )
         else:
-            thread = threading.Thread(target=self.run_video_conversion, args=(files, fmt))
-        thread.daemon = True
-        thread.start()
-
-    def run_conversion(self, files, fmt, quality):
-        try:
-            converted, skipped = self.convert_images(files, fmt, quality)
-            self.root.after(0, lambda: self.conversion_complete(converted, skipped))
-        except Exception as e:
-            self.root.after(0, lambda: self.conversion_error(str(e)))
-
-    def run_video_conversion(self, files, fmt):
-        try:
-            converted, skipped = self.convert_videos(files, fmt)
-            self.root.after(0, lambda: self.conversion_complete(converted, skipped))
-        except Exception as e:
-            self.root.after(0, lambda: self.conversion_error(str(e)))
-
-    def conversion_complete(self, converted, skipped):
+            self.conversion_worker = Worker(
+                self.convert_videos,
+                (self.selected_files, output_format, resize_enabled)
+            )
+        
+        self.conversion_worker.progress.connect(self.update_progress)
+        self.conversion_worker.finished.connect(self.conversion_complete)
+        self.conversion_worker.error.connect(self.conversion_error)
+        self.conversion_worker.start()
+    
+    def update_progress(self, value):
+        self.progress_bar.setValue(value)
+    
+    def conversion_complete(self, result_tuple):
+        # Unpack the result tuple correctly
+        result = result_tuple[0]  # Extract first (and only) element from outer tuple
+        
+        # Now unpack the inner tuple containing converted and skipped counts
+        converted, skipped = result
+        
         self.is_converting = False
-        self.convert_button.config(state=tk.NORMAL)
-        self.status_var.set(f"Completed: {converted} converted, {skipped} skipped")
-        self.show_custom_popup("Done", f"✅ Converted: {converted}\n⏭️ Skipped: {skipped}\n\nSaved to:\n{self.output_folder}")
-        self.progress_var.set(100)
-
-    def conversion_error(self, error):
+        self.convert_button.setEnabled(True)
+        self.progress_bar.setValue(100)
+        self.statusBar().showMessage(f"Completed: {converted} converted, {skipped} skipped")
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Conversion Complete")
+        msg.setText(
+            f"✅ Converted: {converted}\n"
+            f"⏭️ Skipped: {skipped}\n\n"
+            f"Saved to: {self.output_folder}"
+        )
+        msg.setIconPixmap(self.get_accent_icon("info").pixmap(48, 48))
+        msg.exec()
+    
+    def conversion_error(self, error_msg):
         self.is_converting = False
-        self.convert_button.config(state=tk.NORMAL)
-        self.status_var.set("Error during conversion")
-        self.show_custom_popup("Conversion Error", f"An error occurred:\n{error}")
+        self.convert_button.setEnabled(True)
+        self.statusBar().showMessage("Error during conversion")
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Conversion Error")
+        msg.setText(f"An error occurred during conversion:\n{error_msg}")
+        msg.setIconPixmap(self.get_accent_icon("error").pixmap(48, 48))
+        msg.exec()
 
-    def get_new_dimensions(self, original_width, original_height):
-        if not self.resize_var.get():
-            return None, None
-        mode = self.resize_mode_var.get()
-        try:
-            if mode == "width":
-                width = int(self.width_var.get())
-                height = int(original_height * (width / original_width))
-            elif mode == "height":
-                height = int(self.height_var.get())
-                width = int(original_width * (height / original_height))
-            elif mode == "both":
-                width = int(self.width_var.get())
-                height = int(self.height_var.get())
-            else:
-                return None, None
-            return width, height
-        except ValueError:
-            self.show_custom_popup("Invalid Input", "Please enter valid numbers for dimensions.")
-            return None, None
-
-    def convert_images(self, files, target_format, quality):
-        target_ext = '.' + target_format
+    def convert_images(self, files, target_format, quality, resize_enabled):
+        target_ext = f".{target_format.lower()}"
+        
+        # Create output folder
         if os.path.isdir(files[0]):
             output_folder = os.path.join(files[0], f"Converted_to_{target_format}")
         else:
             output_folder = os.path.join(os.path.dirname(files[0]), f"Converted_to_{target_format}")
+        
         os.makedirs(output_folder, exist_ok=True)
         self.output_folder = output_folder
-        converted = skipped = 0
+        
+        converted = 0
+        skipped = 0
         total_files = len(files)
+        
         for idx, file_path in enumerate(files):
-            filename = os.path.basename(file_path)
-            base_name, ext = os.path.splitext(filename)
-            ext = ext.lower()
-            if ext == target_ext:
-                skipped += 1
-                progress = ((idx + 1) / total_files) * 100
-                self.root.after(0, lambda p=progress: self.progress_var.set(p))
-                # Per-file progress bar update
-                if hasattr(self, '_file_progress_bars') and file_path in self._file_progress_bars:
-                    self.root.after(0, lambda fpb=self._file_progress_bars[file_path]: fpb.set(100))
-                continue
             try:
+                # Update progress
+                progress = int(((idx + 0.5) / total_files) * 100)
+                self.conversion_worker.progress.emit(progress)
+                
+                # Skip if same format
+                filename = os.path.basename(file_path)
+                base_name, ext = os.path.splitext(filename)
+                if ext.lower() == target_ext:
+                    skipped += 1
+                    continue
+                
+                # Open and convert image
                 with Image.open(file_path) as img:
-                    if self.resize_var.get():
-                        original_width, original_height = img.size
-                        new_width, new_height = self.get_new_dimensions(original_width, original_height)
-                        if new_width and new_height:
-                            img = img.resize((new_width, new_height), Image.LANCZOS)
+                    # Apply resize if enabled
+                    if resize_enabled:
+                        original_w, original_h = img.size
+                        
+                        # Get new dimensions based on selected resize mode
+                        if self.resize_width_radio.isChecked():
+                            new_width = self.width_input.value()
+                            new_height = int(original_h * (new_width / original_w))
+                        elif self.resize_height_radio.isChecked():
+                            new_height = self.height_input.value()
+                            new_width = int(original_w * (new_height / original_h))
+                        else:  # Both width and height
+                            new_width = self.width_input.value()
+                            new_height = self.height_input.value()
+                        
+                        img = img.resize((new_width, new_height), Image.LANCZOS)
+                    
+                    # Handle mode conversion if needed
                     if img.mode in ("RGBA", "P") and target_format.lower() in ['jpg', 'jpeg']:
                         img = img.convert("RGB")
-                    target_path = os.path.join(output_folder, base_name + target_ext)
+                    
+                    # Save with appropriate quality settings
+                    target_path = os.path.join(output_folder, f"{base_name}{target_ext}")
                     save_args = {}
+                    
                     if target_format.lower() in ['jpg', 'jpeg', 'webp']:
-                        save_args['quality'] = int(quality)
+                        save_args['quality'] = quality
                     elif target_format.lower() == 'png':
+                        # PNG uses compression level (0-9) instead of quality
+                        # Convert quality (10-100) to compression (9-0)
                         compression = min(9, max(0, int(9 - (quality / 10))))
                         save_args['compress_level'] = compression
-                    img.save(target_path, target_format.upper(), **save_args)
+                    
+                    img.save(target_path, **save_args)
                     converted += 1
+                    
             except Exception as e:
-                print(f"Failed: {filename} – {e}")
-            progress = ((idx + 1) / total_files) * 100
-            self.root.after(0, lambda p=progress: self.progress_var.set(p))
-            # Per-file progress bar update
-            if hasattr(self, '_file_progress_bars') and file_path in self._file_progress_bars:
-                self.root.after(0, lambda fpb=self._file_progress_bars[file_path]: fpb.set(100))
+                print(f"Error converting {file_path}: {e}")
+                skipped += 1
+            
+            # Update progress
+            progress = int(((idx + 1) / total_files) * 100)
+            self.conversion_worker.progress.emit(progress)
+        
         return converted, skipped
 
-
-    def convert_videos(self, files, target_format):
-        target_ext = '.' + target_format
+    def convert_videos(self, files, target_format, resize_enabled):
+        if not MOVIEPY_AVAILABLE:
+            raise Exception("moviepy is not installed. Please run: pip install moviepy")
+        
+        target_ext = f".{target_format.lower()}"
+        
+        # Create output folder
         if os.path.isdir(files[0]):
             output_folder = os.path.join(files[0], f"Converted_to_{target_format}")
         else:
             output_folder = os.path.join(os.path.dirname(files[0]), f"Converted_to_{target_format}")
+        
         os.makedirs(output_folder, exist_ok=True)
         self.output_folder = output_folder
-        converted = skipped = 0
+        
+        converted = 0
+        skipped = 0
         total_files = len(files)
-        # Get crop times
-        try:
-            start_time = float(self.start_time_var.get()) if self.start_time_var.get() else None
-        except ValueError:
-            start_time = None
-        try:
-            end_time = float(self.end_time_var.get()) if self.end_time_var.get() else None
-        except ValueError:
-            end_time = None
+        
+        # Get time crop settings
+        start_time = self.start_time.value() if self.start_time.value() > 0 else None
+        end_time = self.end_time.value() if self.end_time.value() > 0 else None
+        
         for idx, file_path in enumerate(files):
-            filename = os.path.basename(file_path)
-            base_name, ext = os.path.splitext(filename)
-            ext = ext.lower()
-            if ext == target_ext:
-                skipped += 1
-                progress = ((idx + 1) / total_files) * 100
-                self.root.after(0, lambda p=progress: self.progress_var.set(p))
-                if hasattr(self, '_file_progress_bars') and file_path in self._file_progress_bars:
-                    self.root.after(0, lambda fpb=self._file_progress_bars[file_path]: fpb.set(100))
-                continue
             try:
+                # Update progress
+                progress = int(((idx + 0.5) / total_files) * 100)
+                self.conversion_worker.progress.emit(progress)
+                
+                # Skip if same format
+                filename = os.path.basename(file_path)
+                base_name, ext = os.path.splitext(filename)
+                if ext.lower() == target_ext:
+                    skipped += 1
+                    continue
+                
+                # Process video
                 clip = VideoFileClip(file_path)
-                # Apply crop if times are valid
+                
+                # Apply time crop if enabled
                 if start_time is not None or end_time is not None:
-                    clip = clip.subclip(start_time if start_time is not None else 0, end_time)
-                if self.resize_var.get():
-                    original_width, original_height = clip.w, clip.h
-                    new_width, new_height = self.get_new_dimensions(original_width, original_height)
-                    if new_width and new_height:
-                        clip = clip.resize((new_width, new_height))
-                target_path = os.path.join(output_folder, base_name + target_ext)
-                if target_format in ['mp4', 'mkv']:
+                    clip = clip.subclip(
+                        start_time if start_time is not None else 0, 
+                        end_time if end_time is not None else clip.duration
+                    )
+                
+                # Apply resize if enabled
+                if resize_enabled:
+                    from moviepy.video.fx import resize as mp_resize
+                    if self.resize_width_radio.isChecked():
+                        new_width = self.width_input.value()
+                        clip = mp_resize(clip, width=new_width)
+                    elif self.resize_height_radio.isChecked():
+                        new_height = self.height_input.value()
+                        clip = mp_resize(clip, height=new_height)
+                    else:  # Both width and height
+                        new_width = self.width_input.value()
+                        new_height = self.height_input.value()
+                        clip = mp_resize(clip, newsize=(new_width, new_height))
+                
+                # Set output path
+                output_path = os.path.join(output_folder, f"{base_name}{target_ext}")
+                
+                # Set codec based on format
+                if target_format.lower() in ['mp4', 'mkv']:
                     codec = 'libx264'
                     audio_codec = 'aac'
-                elif target_format == 'webm':
+                elif target_format.lower() == 'webm':
                     codec = 'libvpx'
                     audio_codec = 'libvorbis'
                 else:
                     codec = None
                     audio_codec = None
-                clip.write_videofile(target_path, codec=codec, audio_codec=audio_codec)
+                
+                # Write video file
+                clip.write_videofile(output_path, codec=codec, audio_codec=audio_codec)
                 clip.close()
+                
                 converted += 1
+                
             except Exception as e:
-                print(f"Failed: {filename} – {e}")
-            progress = ((idx + 1) / total_files) * 100
-            self.root.after(0, lambda p=progress: self.progress_var.set(p))
-            if hasattr(self, '_file_progress_bars') and file_path in self._file_progress_bars:
-                self.root.after(0, lambda fpb=self._file_progress_bars[file_path]: fpb.set(100))
+                print(f"Error converting {file_path}: {e}")
+                skipped += 1
+            
+            # Update progress
+            progress = int(((idx + 1) / total_files) * 100)
+            self.conversion_worker.progress.emit(progress)
+        
         return converted, skipped
 
+# Main application entry point
+def main():
+    # Create the QApplication instance
+    app = QApplication(sys.argv)
 
-    def check_for_update(self):
-        # Check internet connection first
-        try:
-            requests.get("https://www.google.com", timeout=5)
-        except requests.RequestException:
-            messagebox.showerror("No Internet", "Please check your internet connection and try again.")
-            return
-        
+    # --- Splash Screen with logo.png ---
+    logo_path = resource_path("logo.png")
+    if os.path.exists(logo_path):
+        splash_pix = QPixmap(logo_path)
+        if not splash_pix.isNull():
+            splash = QSplashScreen(
+                splash_pix.scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            )
+            splash.show()
+            app.processEvents()
+        else:
+            splash = None
+    else:
+        splash = None
 
-        # Check the github server
-        try:
-            requests.get("https://www.github.com", timeout=5)
-        except requests.RequestException:
-            messagebox.showerror("Server Down", "Oops! It looks like the update server is currently down.\nPlease try again later.")
-            return
+    # Delay for 2 seconds, then show main window
+    def show_main():
+        window = Editara()
+        window.show()
+        if splash:
+            splash.finish(window)
 
-        """Check GitHub for the newest (even pre-release) version and prompt to update."""
-        repo = "basharulalammazu/editara-windows"
-        api_url = f"https://api.github.com/repos/{repo}/releases"
+    QTimer.singleShot(2000, show_main)  # 2000 ms = 2 seconds
 
-        try:
-            response = requests.get(api_url, timeout=5)
-            if response.status_code == 200:
-                releases = response.json()
-                if not releases:
-                    messagebox.showinfo("No Update", "No releases found.")
-                    return
+    sys.exit(app.exec())
 
-                latest = sorted(
-                    releases,
-                    key=lambda r: version.parse(r["tag_name"].lstrip("v")),
-                    reverse=True
-                )[0]
-
-                latest_version = latest["tag_name"].lstrip("v")
-                if version.parse(latest_version) > version.parse(__version__):
-
-                    if messagebox.askyesno(
-                        "Update Available",
-                        f"A newer version ({latest_version}) is available.\n"
-                        f"You are using version {__version__}.\n\n"
-                        "Do you want to download and install the latest version now?"
-                    ):
-                        # Look for .exe asset
-                        exe_asset = next(
-                            (asset for asset in latest["assets"] if asset["name"].endswith(".exe")),
-                            None
-                        )
-
-                        if not exe_asset:
-                            messagebox.showerror("Download Error", "No .exe file found in the latest release.")
-                            return
-
-                        download_url = exe_asset["browser_download_url"]
-                        filename = os.path.basename(urlparse(download_url).path)
-                        save_path = os.path.join(os.path.expanduser("~"), "Downloads", filename)
-
-                        # Download file
-                        try:
-                            with requests.get(download_url, stream=True) as r:
-                                r.raise_for_status()
-                                with open(save_path, 'wb') as f:
-                                    for chunk in r.iter_content(chunk_size=8192):
-                                        f.write(chunk)
-                            messagebox.showinfo("Download Complete", f"The latest version has been downloaded to:\n{save_path}\n\nPlease run it to complete the update.")
-                            os.startfile(save_path)  # Auto-run the installer
-                        except Exception as e:
-                            messagebox.showerror("Download Failed", f"Failed to download update:\n{e}")
-                else:
-                    messagebox.showinfo("Up To Date", f"You are using the latest version ({__version__}).")
-            else:
-                messagebox.showerror("Update Error", "Could not connect to the update server.")
-        except Exception as e:
-            messagebox.showerror("Update Error", f"An error occurred while checking for updates:\n{e}")
-
-
-# Run App
 if __name__ == "__main__":
-    root = TkinterDnD.Tk()
-    ImageConverterApp.show_splash(root, logo_path = resource_path("logo.png"), duration=2000)
-    app = ImageConverterApp(root)
-    root.mainloop()
+    main()

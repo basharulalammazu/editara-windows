@@ -2,11 +2,10 @@
 !*.py
 !*.json
 
-
 # PyInstaller build artifacts
 dist/
 build/
-*.spec
+main.spec
 *.txt
 
 # Compressed and archive files
